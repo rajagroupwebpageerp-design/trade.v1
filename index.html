@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Intraday Multi-Asset Scanner</title>
+    <style>
+        :root {
+            --bg-color: #0f172a;
+            --card-bg: #1e293b;
+            --text-color: #f8fafc;
+            --accent-green: #22c55e;
+            --accent-red: #ef4444;
+            --border-color: #334155;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            background-color: var(--bg-color);
+            color: var(--text-color);
+            margin: 0;
+            padding: 20px;
+        }
+
+        .header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border-bottom: 2px solid var(--border-color);
+            padding-bottom: 15px;
+            margin-bottom: 20px;
+        }
+
+        .controls {
+            display: flex;
+            gap: 15px;
+            margin-bottom: 15px;
+            align-items: center;
+        }
+
+        .filter-btn {
+            background-color: #334155;
+            color: #f8fafc;
+            border: 1px solid var(--border-color);
+            padding: 8px 16px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-weight: 600;
+        }
+
+        .filter-btn.active {
+            background-color: #3b82f6;
+            border-color: #3b82f6;
+        }
+
+        .status-badge {
+            padding: 8px 14px;
+            border-radius: 6px;
+            font-size: 0.9rem;
+            font-weight: bold;
+            background-color: #334155;
+            color: #38bdf8;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            background-color: var(--card-bg);
+            border-radius: 8px;
+            overflow: hidden;
+        }
+
+        th, td {
+            padding: 12px 14px;
+            text-align: left;
+            border-bottom: 1px solid var(--border-color);
+            font-size: 0.9rem;
+        }
+
+        th {
+            background-color: #0f172a;
+            color: #94a3b8;
+            font-size: 0.8rem;
+            text-transform: uppercase;
+        }
+
+        .badge {
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-size: 0.75rem;
+            font-weight: 700;
+        }
+
+        .bullish { background-color: rgba(34, 197, 94, 0.2); color: var(--accent-green); }
+        .bearish { background-color: rgba(239, 68, 68, 0.2); color: var(--accent-red); }
+        .neutral { background-color: rgba(148, 163, 184, 0.2); color: #94a3b8; }
+
+        .price-text { font-family: monospace; font-weight: 600; }
+        .sl-text { color: #f87171; font-family: monospace; font-weight: 600; }
+        .target-text { color: #4ade80; font-family: monospace; font-weight: 600; }
+    </style>
+</head>
+<body>
+
+    <div class="header">
+        <div>
+            <h2>Intraday Trading Scanner</h2>
+            <p style="color: #94a3b8; margin: 0;">5M Technical Strategy: EMA (9/21), RSI, VWAP & MACD Filters</p>
+        </div>
+        <span id="apiStatus" class="status-badge">Connecting...</span>
+    </div>
+
+    <div class="controls">
+        <span><strong>Filter Asset Category:</strong></span>
+        <button class="filter-btn active" onclick="setFilter('ALL', this)">All Assets</button>
+        <button class="filter-btn" onclick="setFilter('Commodities', this)">Commodities</button>
+        <button class="filter-btn" onclick="setFilter('Equities', this)">Stocks & Indices</button>
+    </div>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Asset</th>
+                <th>Category</th>
+                <th>Live Price</th>
+                <th>EMA (9/21)</th>
+                <th>RSI (14)</th>
+                <th>MACD Filter</th>
+                <th>VWAP Pos.</th>
+                <th>Intraday Signal</th>
+                <th>Entry Level</th>
+                <th>Stop Loss</th>
+                <th>Target (1:2)</th>
+            </tr>
+        </thead>
+        <tbody id="marketDataTable">
+            <tr><td colspan="11" style="text-align:center;">Loading intraday scanner data...</td></tr>
+        </tbody>
+    </table>
+
+    <script>
+        let rawData = {};
+        let currentCategory = "ALL";
+
+        function setFilter(category, button) {
+            currentCategory = category;
+            document.querySelectorAll('.filter-btn').forEach(btn => btn.classList.remove('active'));
+            button.classList.add('active');
+            renderTable();
+        }
+
+        async function fetchLiveMarketData() {
+            const statusBadge = document.getElementById("apiStatus");
+
+            try {
+                const response = await fetch("http://localhost:5000/api/live-data");
+                rawData = await response.json();
+
+                statusBadge.innerText = "● LIVE FEED ACTIVE";
+                statusBadge.style.color = "#22c55e";
+                renderTable();
+            } catch (err) {
+                statusBadge.innerText = "● SERVER OFFLINE";
+                statusBadge.style.color = "#ef4444";
+                document.getElementById("marketDataTable").innerHTML = `<tr><td colspan="11" style="text-align:center; color:#ef4444;">Unable to connect. Ensure python server.py is running.</td></tr>`;
+            }
+        }
+
+        function renderTable() {
+            const tableBody = document.getElementById("marketDataTable");
+            tableBody.innerHTML = "";
+
+            Object.keys(rawData).forEach(symbol => {
+                const item = rawData[symbol];
+
+                // Filter logic
+                if (currentCategory !== "ALL") {
+                    if (currentCategory === "Equities" && (item.category !== "Equities" && item.category !== "Indices")) return;
+                    if (currentCategory === "Commodities" && item.category !== "Commodities") return;
+                }
+
+                let signalBadge = `<span class="badge neutral">NEUTRAL</span>`;
+                if (item.signal === "BUY") signalBadge = `<span class="badge bullish">BUY (LONG)</span>`;
+                if (item.signal === "SELL") signalBadge = `<span class="badge bearish">SELL (SHORT)</span>`;
+
+                const row = `
+                    <tr>
+                        <td><strong>${symbol}</strong></td>
+                        <td><span class="badge neutral">${item.category}</span></td>
+                        <td class="price-text">₹${item.ltp}</td>
+                        <td><span class="badge ${item.emaBullish ? 'bullish' : 'bearish'}">${item.emaBullish ? '9 > 21' : '9 < 21'}</span></td>
+                        <td>${item.rsi}</td>
+                        <td><span class="badge ${item.macdBullish ? 'bullish' : 'bearish'}">${item.macdBullish ? 'Bullish' : 'Bearish'}</span></td>
+                        <td>${item.vwapAbove ? 'Above VWAP' : 'Below VWAP'}</td>
+                        <td>${signalBadge}</td>
+                        <td class="price-text">${item.entry > 0 ? '₹' + item.entry : '-'}</td>
+                        <td class="sl-text">${item.sl > 0 ? '₹' + item.sl : '-'}</td>
+                        <td class="target-text">${item.target > 0 ? '₹' + item.target : '-'}</td>
+                    </tr>
+                `;
+                tableBody.innerHTML += row;
+            });
+        }
+
+        fetchLiveMarketData();
+        setInterval(fetchLiveMarketData, 10000);
+    </script>
+</body>
+</html>
