@@ -3,4 +3,5 @@ flask-cors
 yfinance
 pandas
 numpy
+curl_cffi
 gunicorn
