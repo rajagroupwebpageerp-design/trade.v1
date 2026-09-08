@@ -1,5 +1,8 @@
+import json
 import logging
+import os
 import sys
+import tempfile
 import threading
 import time
 
@@ -72,16 +75,57 @@ SESSION = make_session()
 # background thread refreshes the cache on its own schedule. All incoming
 # /api/live-data requests just read the cache instantly, no matter how often
 # clients poll.
+#
+# IMPORTANT: gunicorn can run multiple worker PROCESSES, each with its own
+# separate Python memory. An in-memory-only cache means each worker has its
+# own independent copy — one worker's background thread can be happily
+# fetching and logging success, while a request that happens to land on a
+# *different* worker sees a permanently empty cache. That was exactly the
+# bug: logs showed successful cycles, but /api/live-data kept returning {}.
+#
+# Fix: persist the cache to a JSON file on disk (shared filesystem within
+# the same container/instance). Every worker's background thread writes to
+# this file, and every request reads straight from the file — so it doesn't
+# matter which worker handles which request, they all see the same data.
+# Writes are atomic (write to a temp file, then os.replace) so a reader
+# never sees a half-written file.
 # ----------------------------------------------------------------------------
-CACHE_LOCK = threading.Lock()
-CACHE = {
-    "data": {},
-    "last_updated": None,
-    "last_error": None,
-}
+CACHE_FILE = os.path.join(tempfile.gettempdir(), "trade_scanner_cache.json")
+CACHE_WRITE_LOCK = threading.Lock()  # only guards this process's own writes
 
 REFRESH_INTERVAL_SECONDS = 45   # how often we hit Yahoo for fresh data
 PER_SYMBOL_DELAY_SECONDS = 0.4  # small stagger so 18 calls don't fire as a burst
+
+
+def read_cache():
+    """Read the shared cache file. Safe to call from any worker process."""
+    try:
+        with open(CACHE_FILE, "r") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {"data": {}, "last_updated": None, "last_error": None}
+
+
+def write_cache(data=None, last_error=None):
+    """Atomically write the shared cache file so readers never see a
+    half-written/corrupt file mid-write."""
+    with CACHE_WRITE_LOCK:
+        current = read_cache()
+        if data is not None:
+            current["data"] = data
+        if last_error is not None or data is not None:
+            current["last_error"] = last_error
+        current["last_updated"] = time.time()
+
+        fd, tmp_path = tempfile.mkstemp(dir=tempfile.gettempdir())
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump(current, f)
+            os.replace(tmp_path, CACHE_FILE)  # atomic on POSIX
+        except Exception:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+            raise
 
 
 def calculate_indicators(df):
@@ -182,11 +226,13 @@ def fetch_one(name, ticker, category, session):
 
 
 def refresh_cache():
-    """Runs in a background thread forever, refreshing CACHE every
-    REFRESH_INTERVAL_SECONDS. This decouples Yahoo request volume from
+    """Runs in a background thread forever, refreshing the shared cache file
+    every REFRESH_INTERVAL_SECONDS. This decouples Yahoo request volume from
     however often browsers poll the API."""
     global SESSION
     consecutive_all_empty = 0
+    pid = os.getpid()
+    log.info("Background refresh thread started in worker pid=%d", pid)
 
     while True:
         start = time.time()
@@ -201,36 +247,32 @@ def refresh_cache():
                 empty_count += 1
             time.sleep(PER_SYMBOL_DELAY_SECONDS)
 
-        with CACHE_LOCK:
-            if results:
-                CACHE["data"] = results
-                CACHE["last_error"] = None
-            # If literally everything failed, keep serving the last good
-            # cache instead of overwriting it with {} — better a slightly
-            # stale table than a blank one.
-            if empty_count == len(SYMBOLS):
-                CACHE["last_error"] = "All symbols failed this cycle — likely Yahoo Finance blocking/rate-limiting this server's IP."
-                log.error(CACHE["last_error"])
-            CACHE["last_updated"] = time.time()
+        if results:
+            # Keep serving the last good cache if this cycle produced
+            # nothing new — better a slightly stale table than a blank one.
+            write_cache(data=results, last_error=None)
+        if empty_count == len(SYMBOLS):
+            err = "All symbols failed this cycle — likely Yahoo Finance blocking/rate-limiting this server's IP."
+            write_cache(data=None, last_error=err)
+            log.error("[pid=%d] %s", pid, err)
 
         if empty_count == len(SYMBOLS):
             consecutive_all_empty += 1
             log.error(
-                "ALL %d symbols failed (%d consecutive full-failure cycles). "
-                "This strongly suggests Yahoo Finance is blocking this server's IP, "
-                "not a code bug. Consider a different data provider if this persists.",
-                len(SYMBOLS), consecutive_all_empty,
+                "[pid=%d] ALL %d symbols failed (%d consecutive full-failure cycles).",
+                pid, len(SYMBOLS), consecutive_all_empty,
             )
-            # Recreate the session in case it's the specific TLS session that
-            # got flagged.
             if consecutive_all_empty % 3 == 0:
-                log.info("Recreating yfinance session after repeated full failures")
+                log.info("[pid=%d] Recreating yfinance session after repeated full failures", pid)
                 SESSION = make_session()
         else:
             consecutive_all_empty = 0
-            log.info(
-                "Cycle complete: %d/%d symbols OK", len(results), len(SYMBOLS)
-            )
+            log.info("[pid=%d] Cycle complete: %d/%d symbols OK", pid, len(results), len(SYMBOLS))
+
+        try:
+            os.utime(LOCK_FILE, None)  # prove this worker is still alive
+        except FileNotFoundError:
+            pass
 
         elapsed = time.time() - start
         sleep_for = max(REFRESH_INTERVAL_SECONDS - elapsed, 5)
@@ -239,30 +281,77 @@ def refresh_cache():
 
 @app.route("/api/live-data", methods=["GET"])
 def get_live_data():
-    with CACHE_LOCK:
-        return jsonify(CACHE["data"])
+    cache = read_cache()
+    return jsonify(cache["data"])
 
 
 @app.route("/api/status", methods=["GET"])
 def get_status():
     """Diagnostic endpoint: hit this in your browser to see cache health
     without guessing from the raw data endpoint."""
-    with CACHE_LOCK:
-        return jsonify({
-            "last_updated": CACHE["last_updated"],
-            "symbols_cached": len(CACHE["data"]),
-            "symbols_expected": len(SYMBOLS),
-            "last_error": CACHE["last_error"],
-        })
+    cache = read_cache()
+    return jsonify({
+        "last_updated": cache["last_updated"],
+        "symbols_cached": len(cache["data"]),
+        "symbols_expected": len(SYMBOLS),
+        "last_error": cache["last_error"],
+        "served_by_pid": os.getpid(),
+    })
 
 
-# Start the background refresh thread once, at import time, so it runs under
-# both `python server.py` and a production WSGI server like gunicorn.
-_refresh_thread = threading.Thread(target=refresh_cache, daemon=True)
-_refresh_thread.start()
+# ----------------------------------------------------------------------------
+# Only ONE worker process should run the background fetch loop — otherwise
+# every worker hits Yahoo independently, multiplying request volume and
+# raising the odds of getting rate-limited again. We use a simple lock FILE
+# (not the cache file) as a cross-process mutex: whichever worker process
+# creates it first "wins" and runs the loop; the rest skip starting their
+# own thread and just serve reads from the shared cache file.
+# ----------------------------------------------------------------------------
+LOCK_FILE = os.path.join(tempfile.gettempdir(), "trade_scanner_refresh.lock")
+LOCK_STALE_SECONDS = REFRESH_INTERVAL_SECONDS * 4  # if not refreshed in this long, assume the owner died
+
+
+def try_become_refresher():
+    # If a lock file exists but hasn't been touched in a while, its owner
+    # likely crashed/restarted without cleaning up — reclaim it so the cache
+    # doesn't stay frozen forever.
+    try:
+        age = time.time() - os.path.getmtime(LOCK_FILE)
+        if age > LOCK_STALE_SECONDS:
+            log.warning("Refresh lock is stale (%.0fs old) — reclaiming it", age)
+            os.remove(LOCK_FILE)
+    except FileNotFoundError:
+        pass
+
+    try:
+        fd = os.open(LOCK_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        with os.fdopen(fd, "w") as f:
+            f.write(str(os.getpid()))
+        return True
+    except FileExistsError:
+        return False
+
+
+def refresh_loop_with_lock():
+    """Wraps refresh_cache so it periodically re-touches the lock file
+    (proves this worker is still alive) and releases the lock if it ever
+    exits, so another worker can take over."""
+    try:
+        refresh_cache()
+    finally:
+        try:
+            os.remove(LOCK_FILE)
+        except FileNotFoundError:
+            pass
+
+
+if try_become_refresher():
+    _refresh_thread = threading.Thread(target=refresh_loop_with_lock, daemon=True)
+    _refresh_thread.start()
+else:
+    log.info("Another worker already owns the refresh loop; pid=%d will only serve reads", os.getpid())
 
 if __name__ == "__main__":
-    import os
     port = int(os.environ.get("PORT", 5000))
     log.info("Starting Multi-Asset Intraday Trading Bridge on port %d", port)
     app.run(host="0.0.0.0", port=port)
