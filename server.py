@@ -140,10 +140,18 @@ def calculate_indicators(df):
     rs = gain / loss
     df["RSI"] = 100 - (100 / (1 + rs))
 
-    # VWAP
-    df["VWAP"] = (
-        df["Volume"] * (df["High"] + df["Low"] + df["Close"]) / 3
-    ).cumsum() / df["Volume"].cumsum()
+    # VWAP must reset every trading day — it's meaningless accumulated across
+    # multiple days. Now that fetch_one() pulls several days of history (for
+    # EMA/RSI/MACD warm-up), we group by calendar date so each day gets its
+    # own independent cumulative VWAP, exactly like the backtest does.
+    df["_date"] = df.index.date
+
+    def _day_vwap(g):
+        typical = (g["High"] + g["Low"] + g["Close"]) / 3
+        return (g["Volume"] * typical).cumsum() / g["Volume"].cumsum()
+
+    df["VWAP"] = df.groupby("_date", group_keys=False).apply(_day_vwap)
+    df.drop(columns=["_date"], inplace=True)
 
     # MACD (12, 26, 9)
     ema12 = df["Close"].ewm(span=12, adjust=False).mean()
@@ -159,18 +167,29 @@ def fetch_one(name, ticker, category, session):
     or None. Logs the reason on every failure path so nothing fails silently."""
     try:
         stock = yf.Ticker(ticker, session=session)
-        df = stock.history(period="1d", interval="5m")
+        # Pull several days of 5-minute bars, not just "today". EMA/RSI/MACD
+        # need ~26 bars of warm-up; at 5-minute bars that's ~2+ hours, so a
+        # period="1d" fetch has NO valid signal for the first couple of
+        # hours after market open every single day. Pulling prior days'
+        # bars lets the indicators warm up using yesterday's data, so
+        # today's very first bars already have valid EMA/RSI/MACD values.
+        # VWAP is unaffected — calculate_indicators() resets it per calendar
+        # day regardless of how many days of history we pass in.
+        df = stock.history(period="5d", interval="5m")
 
         if df.empty:
-            log.warning("%s (%s): yfinance returned an EMPTY dataframe", name, ticker)
-            return None
+            log.warning("%s (%s): yfinance returned an EMPTY dataframe (hard failure)", name, ticker)
+            return None, "hard_failure"
 
         if len(df) < 26:
+            # With a 5-day window this should be rare (e.g. a symbol with a
+            # very short trading history, or a market holiday gap). This is
+            # NOT the same as Yahoo blocking us, so it's tracked separately.
             log.warning(
-                "%s (%s): only %d bars available, need >= 26 for MACD/indicators",
+                "%s (%s): only %d bars available even with 5d window, need >= 26",
                 name, ticker, len(df),
             )
-            return None
+            return None, "insufficient_data"
 
         df = calculate_indicators(df)
         latest = df.iloc[-1]
@@ -182,6 +201,10 @@ def fetch_one(name, ticker, category, session):
         vwap = round(float(latest["VWAP"]), 2) if not np.isnan(latest["VWAP"]) else ema21
         macd = round(float(latest["MACD"]), 2)
         macd_signal = round(float(latest["MACD_Signal"]), 2)
+
+        if any(np.isnan(x) for x in [ema21, ema9, rsi, macd, macd_signal]):
+            log.warning("%s (%s): latest bar still has NaN indicator(s), skipping this cycle", name, ticker)
+            return None, "insufficient_data"
 
         ema_bullish = ema9 > ema21
         vwap_above = ltp > vwap
@@ -218,11 +241,11 @@ def fetch_one(name, ticker, category, session):
             "entry": entry,
             "sl": sl,
             "target": target,
-        }
+        }, None
 
     except Exception as e:
         log.error("%s (%s): EXCEPTION during fetch: %s", name, ticker, e, exc_info=True)
-        return None
+        return None, "hard_failure"
 
 
 def refresh_cache():
@@ -230,44 +253,59 @@ def refresh_cache():
     every REFRESH_INTERVAL_SECONDS. This decouples Yahoo request volume from
     however often browsers poll the API."""
     global SESSION
-    consecutive_all_empty = 0
+    consecutive_all_hard_failed = 0
     pid = os.getpid()
     log.info("Background refresh thread started in worker pid=%d", pid)
 
     while True:
         start = time.time()
         results = {}
-        empty_count = 0
+        hard_failures = 0
+        insufficient_data = 0
 
         for name, item in SYMBOLS.items():
-            result = fetch_one(name, item["ticker"], item["category"], SESSION)
+            result, fail_type = fetch_one(name, item["ticker"], item["category"], SESSION)
             if result is not None:
                 results[name] = result
-            else:
-                empty_count += 1
+            elif fail_type == "hard_failure":
+                hard_failures += 1
+            elif fail_type == "insufficient_data":
+                insufficient_data += 1
             time.sleep(PER_SYMBOL_DELAY_SECONDS)
+
+        total = len(SYMBOLS)
 
         if results:
             # Keep serving the last good cache if this cycle produced
             # nothing new — better a slightly stale table than a blank one.
             write_cache(data=results, last_error=None)
-        if empty_count == len(SYMBOLS):
-            err = "All symbols failed this cycle — likely Yahoo Finance blocking/rate-limiting this server's IP."
+
+        if hard_failures == total:
+            # Every symbol had a genuine fetch failure (empty df / exception)
+            # — THIS is the real signature of Yahoo blocking/rate-limiting,
+            # not "not enough bars yet" which is expected early in the day.
+            err = "All symbols had genuine fetch failures this cycle — likely Yahoo Finance blocking/rate-limiting this server's IP."
             write_cache(data=None, last_error=err)
             log.error("[pid=%d] %s", pid, err)
-
-        if empty_count == len(SYMBOLS):
-            consecutive_all_empty += 1
-            log.error(
-                "[pid=%d] ALL %d symbols failed (%d consecutive full-failure cycles).",
-                pid, len(SYMBOLS), consecutive_all_empty,
-            )
-            if consecutive_all_empty % 3 == 0:
-                log.info("[pid=%d] Recreating yfinance session after repeated full failures", pid)
+            consecutive_all_hard_failed += 1
+            if consecutive_all_hard_failed % 3 == 0:
+                log.info("[pid=%d] Recreating yfinance session after repeated hard failures", pid)
                 SESSION = make_session()
+        elif insufficient_data == total:
+            # Expected in the first ~2 hours after market open before EMA/
+            # RSI/MACD have enough bars to warm up. Not an error condition.
+            consecutive_all_hard_failed = 0
+            log.info(
+                "[pid=%d] All %d symbols still warming up (insufficient bars) — "
+                "normal in the first couple hours after market open.",
+                pid, total,
+            )
         else:
-            consecutive_all_empty = 0
-            log.info("[pid=%d] Cycle complete: %d/%d symbols OK", pid, len(results), len(SYMBOLS))
+            consecutive_all_hard_failed = 0
+            log.info(
+                "[pid=%d] Cycle complete: %d/%d OK, %d insufficient data, %d hard failures",
+                pid, len(results), total, insufficient_data, hard_failures,
+            )
 
         try:
             os.utime(LOCK_FILE, None)  # prove this worker is still alive
