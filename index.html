@@ -36,6 +36,7 @@
             gap: 15px;
             margin-bottom: 15px;
             align-items: center;
+            flex-wrap: wrap;
         }
 
         .filter-btn {
@@ -51,6 +52,11 @@
         .filter-btn.active {
             background-color: #3b82f6;
             border-color: #3b82f6;
+        }
+
+        .tf-btn.active {
+            background-color: #a855f7;
+            border-color: #a855f7;
         }
 
         .status-badge {
@@ -89,6 +95,7 @@
             border-radius: 4px;
             font-size: 0.75rem;
             font-weight: 700;
+            cursor: default;
         }
 
         .bullish { background-color: rgba(34, 197, 94, 0.2); color: var(--accent-green); }
@@ -105,7 +112,7 @@
     <div class="header">
         <div>
             <h2>Intraday Trading Scanner</h2>
-            <p style="color: #94a3b8; margin: 0;">5M Technical Strategy: EMA (9/21), RSI, VWAP & MACD Filters</p>
+            <p style="color: #94a3b8; margin: 0;">5M Technical Strategy: EMA (9/21), RSI, VWAP & MACD Filters + SMC (Order Blocks, FVG, QML)</p>
         </div>
         <span id="apiStatus" class="status-badge">Connecting...</span>
     </div>
@@ -115,6 +122,15 @@
         <button class="filter-btn active" onclick="setFilter('ALL', this)">All Assets</button>
         <button class="filter-btn" onclick="setFilter('Commodities', this)">Commodities</button>
         <button class="filter-btn" onclick="setFilter('Equities', this)">Stocks & Indices</button>
+    </div>
+
+    <div class="controls">
+        <span><strong>SMC Timeframe:</strong></span>
+        <button class="filter-btn tf-btn active" onclick="setTF('5m', this)">5M</button>
+        <button class="filter-btn tf-btn" onclick="setTF('15m', this)">15M</button>
+        <button class="filter-btn tf-btn" onclick="setTF('1h', this)">1H</button>
+        <button class="filter-btn tf-btn" onclick="setTF('4h', this)">4H</button>
+        <button class="filter-btn tf-btn" onclick="setTF('1d', this)">1D</button>
     </div>
 
     <table>
@@ -127,6 +143,9 @@
                 <th>RSI (14)</th>
                 <th>MACD Filter</th>
                 <th>VWAP Pos.</th>
+                <th>Order Block</th>
+                <th>FVG</th>
+                <th>QML</th>
                 <th>Intraday Signal</th>
                 <th>Entry Level</th>
                 <th>Stop Loss</th>
@@ -134,17 +153,25 @@
             </tr>
         </thead>
         <tbody id="marketDataTable">
-            <tr><td colspan="11" style="text-align:center;">Loading intraday scanner data...</td></tr>
+            <tr><td colspan="14" style="text-align:center;">Loading intraday scanner data...</td></tr>
         </tbody>
     </table>
 
     <script>
         let rawData = {};
         let currentCategory = "ALL";
+        let currentTF = "5m";
 
         function setFilter(category, button) {
             currentCategory = category;
-            document.querySelectorAll('.filter-btn').forEach(btn => btn.classList.remove('active'));
+            document.querySelectorAll('.filter-btn:not(.tf-btn)').forEach(btn => btn.classList.remove('active'));
+            button.classList.add('active');
+            renderTable();
+        }
+
+        function setTF(tf, button) {
+            currentTF = tf;
+            document.querySelectorAll('.tf-btn').forEach(btn => btn.classList.remove('active'));
             button.classList.add('active');
             renderTable();
         }
@@ -163,8 +190,54 @@ const response = await fetch("https://trade-v1-1.onrender.com/api/live-data");
             } catch (err) {
                 statusBadge.innerText = "● SERVER OFFLINE";
                 statusBadge.style.color = "#ef4444";
-                document.getElementById("marketDataTable").innerHTML = `<tr><td colspan="11" style="text-align:center; color:#ef4444;">Unable to connect. Ensure python server.py is running.</td></tr>`;
+                document.getElementById("marketDataTable").innerHTML = `<tr><td colspan="14" style="text-align:center; color:#ef4444;">Unable to connect. Ensure python server.py is running.</td></tr>`;
             }
+        }
+
+        // Picks the single most relevant zone (closest to the live price) out
+        // of a list of OB/FVG zones for the currently selected timeframe.
+        // Prefers zones that haven't been mitigated/filled yet.
+        function pickNearestZone(zones, ltp) {
+            if (!zones || !zones.length) return null;
+            const unmitigated = zones.filter(z => !z.mitigated);
+            const pool = unmitigated.length ? unmitigated : zones;
+            let best = null;
+            let bestDist = Infinity;
+            pool.forEach(z => {
+                const mid = (z.top + z.bottom) / 2;
+                const dist = Math.abs(ltp - mid);
+                if (dist < bestDist) {
+                    bestDist = dist;
+                    best = z;
+                }
+            });
+            return best;
+        }
+
+        // Prefers a confirmed QML setup over one still forming; otherwise
+        // just returns whichever (bullish/bearish) is present.
+        function pickQml(smcTf) {
+            const candidates = [smcTf.qmlBullish, smcTf.qmlBearish].filter(Boolean);
+            if (!candidates.length) return null;
+            candidates.sort((a, b) => (a.status === 'confirmed' ? 0 : 1) - (b.status === 'confirmed' ? 0 : 1));
+            return candidates[0];
+        }
+
+        function zoneBadge(zone, bullLabel, bearLabel, mitigatedWord) {
+            if (!zone) return `<span class="badge neutral">-</span>`;
+            const cls = zone.type === 'bullish' ? 'bullish' : 'bearish';
+            const label = zone.type === 'bullish' ? bullLabel : bearLabel;
+            const dot = zone.mitigated ? ' •' : '';
+            const title = `${zone.bottom} – ${zone.top}${zone.mitigated ? ' (' + mitigatedWord + ')' : ''}`;
+            return `<span class="badge ${cls}" title="${title}">${label}${dot}</span>`;
+        }
+
+        function qmlBadge(qml) {
+            if (!qml) return `<span class="badge neutral">-</span>`;
+            const cls = qml.type === 'bullish' ? 'bullish' : 'bearish';
+            const label = qml.type === 'bullish' ? 'Bull QML' : 'Bear QML';
+            const title = `Neckline ${qml.neckline}, sweep ${qml.sweepLevel}`;
+            return `<span class="badge ${cls}" title="${title}">${label} (${qml.status})</span>`;
         }
 
         function renderTable() {
@@ -184,6 +257,11 @@ const response = await fetch("https://trade-v1-1.onrender.com/api/live-data");
                 if (item.signal === "BUY") signalBadge = `<span class="badge bullish">BUY (LONG)</span>`;
                 if (item.signal === "SELL") signalBadge = `<span class="badge bearish">SELL (SHORT)</span>`;
 
+                const smcTf = (item.smc && item.smc[currentTF]) || { orderBlocks: [], fvg: [], qmlBullish: null, qmlBearish: null };
+                const obBadge = zoneBadge(pickNearestZone(smcTf.orderBlocks, item.ltp), 'Bull OB', 'Bear OB', 'mitigated');
+                const fvgBadge = zoneBadge(pickNearestZone(smcTf.fvg, item.ltp), 'Bull FVG', 'Bear FVG', 'filled');
+                const qmlBadgeHtml = qmlBadge(pickQml(smcTf));
+
                 const row = `
                     <tr>
                         <td><strong>${symbol}</strong></td>
@@ -193,6 +271,9 @@ const response = await fetch("https://trade-v1-1.onrender.com/api/live-data");
                         <td>${item.rsi}</td>
                         <td><span class="badge ${item.macdBullish ? 'bullish' : 'bearish'}">${item.macdBullish ? 'Bullish' : 'Bearish'}</span></td>
                         <td>${item.vwapAbove ? 'Above VWAP' : 'Below VWAP'}</td>
+                        <td>${obBadge}</td>
+                        <td>${fvgBadge}</td>
+                        <td>${qmlBadgeHtml}</td>
                         <td>${signalBadge}</td>
                         <td class="price-text">${item.entry > 0 ? '₹' + item.entry : '-'}</td>
                         <td class="sl-text">${item.sl > 0 ? '₹' + item.sl : '-'}</td>
