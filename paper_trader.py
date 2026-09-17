@@ -1,17 +1,20 @@
 """
-paper_trader.py — a fully simulated (no real orders placed anywhere) paper
-trading bot.
+paper_trader.py — simulated (no real orders) paper trading, run as THREE
+independent strategies so their P&L can be tracked and compared separately:
 
-Rule: on the 5-minute base indicators —
-  - ALL of EMA(9>21), RSI, MACD, VWAP green  -> open a virtual LONG
-  - ALL of them red                          -> open a virtual SHORT
-  - while in a position, the INSTANT any single one of those four flips
-    against it (not necessarily all four reversing) -> close the position
+  "base" — the original rule: ALL of EMA(9>21)/RSI/MACD/VWAP (5M) green
+           opens a LONG, all red opens a SHORT; exits the instant any ONE
+           of the four flips against the position.
+  "smc"  — opens off the 5M SMC trade setup (the nearest unmitigated OB/FVG
+           zone, or a confirmed QML) at the live price, using that setup's
+           own stop-loss/target; exits when price hits either.
+  "mtf"  — opens when the 5M+15M+1H multi-timeframe signal agrees (BUY or
+           SELL); exits the instant that agreement breaks.
 
-One open position per symbol at a time. State (open positions + a capped
-closed-trade log) persists to a shared JSON file the same way the market
-data cache does in server.py, so every gunicorn worker process sees the
-same state regardless of which one handled a given request.
+Each strategy keeps its own open positions, closed-trade log, and daily
+(IST) P&L summary — all three persisted together in one shared JSON state
+file (same atomic-write pattern as the market data cache), so every
+gunicorn worker process sees the same state.
 """
 
 import json
@@ -27,15 +30,17 @@ log = logging.getLogger("trade-scanner")
 PAPER_FILE = os.path.join(tempfile.gettempdir(), "trade_scanner_paper.json")
 PAPER_LOCK = threading.Lock()
 
-MAX_CLOSED_TRADES = 200  # bounded log; oldest trades drop off past this
-MAX_DAILY_SUMMARIES = 90  # keep roughly a trading quarter's worth of days
+MAX_CLOSED_TRADES = 200      # per-strategy bounded log
+MAX_DAILY_SUMMARIES = 90     # per-strategy, roughly a trading quarter
 
-# Flip to False to go long-only (SHORT entries simply never trigger).
+# Flip to False to go long-only across all three strategies.
 ALLOW_SHORTS = True
 
-# Fixed UTC+5:30 offset — India doesn't observe DST, so this is correct
-# year-round without needing the zoneinfo package. Used to group closed
-# trades into calendar trading days for the daily P&L summary.
+STRATEGIES = ["base", "smc", "mtf"]
+
+# Fixed UTC+5:30 — India doesn't observe DST, so this is correct year-round
+# without needing the zoneinfo package. Used to group closed trades into
+# calendar trading days for the daily P&L summary.
 IST = timezone(timedelta(hours=5, minutes=30))
 
 
@@ -43,13 +48,24 @@ def _ist_date_str(unix_ts):
     return datetime.fromtimestamp(unix_ts, tz=IST).strftime("%Y-%m-%d")
 
 
+def _empty_strategy_state():
+    return {"positions": {}, "closedTrades": [], "dailyStats": {}}
+
+
 def read_state():
-    """Read the shared paper-trading state file. Safe from any worker."""
+    """Read the shared paper-trading state file. Safe from any worker.
+    Always returns a dict with all three strategy keys present, even on a
+    fresh file, so callers never need to guard for missing keys."""
     try:
         with open(PAPER_FILE, "r") as f:
-            return json.load(f)
+            state = json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
-        return {"positions": {}, "closedTrades": []}
+        state = {}
+    strategies = state.get("strategies", {})
+    for key in STRATEGIES:
+        strategies.setdefault(key, _empty_strategy_state())
+    state["strategies"] = strategies
+    return state
 
 
 def write_state(state):
@@ -74,11 +90,8 @@ def _all_red(item):
     return (not item["emaBullish"]) and (not item["vwapAbove"]) and item["rsi"] < 48 and (not item["macdBullish"])
 
 
-def _record_daily_stats(state, trade):
-    """Roll a just-closed trade into its exit day's running summary. Stored
-    separately from the (capped) closed-trade log so day-level P&L survives
-    even after hundreds of trades push individual trades out of that log."""
-    daily = state.setdefault("dailyStats", {})
+def _record_daily_stats(strat_state, trade):
+    daily = strat_state.setdefault("dailyStats", {})
     day_key = _ist_date_str(trade["exitTime"])
     day = daily.setdefault(day_key, {"totalTrades": 0, "wins": 0, "losses": 0, "totalPnlPct": 0.0})
     day["totalTrades"] += 1
@@ -88,19 +101,204 @@ def _record_daily_stats(state, trade):
         day["losses"] += 1
     day["totalPnlPct"] = round(day["totalPnlPct"] + trade["pnlPct"], 3)
 
-    # Trim to the most recent MAX_DAILY_SUMMARIES calendar days so this
-    # dict can't grow forever over months/years of uptime.
     if len(daily) > MAX_DAILY_SUMMARIES:
         for old_key in sorted(daily.keys())[: len(daily) - MAX_DAILY_SUMMARIES]:
             del daily[old_key]
 
 
-def get_daily_summaries(state=None, limit=30):
-    """Most recent `limit` days' P&L summaries, newest first, each with
-    win rate and avg PnL/trade derived on read."""
-    if state is None:
-        state = read_state()
-    daily = state.get("dailyStats", {})
+def _close_trade(strategy_key, strat_state, symbol, pos, exit_price, reason, now):
+    entry_price = pos["entryPrice"]
+    if pos["side"] == "LONG":
+        pnl_pct = round((exit_price - entry_price) / entry_price * 100, 3)
+    else:
+        pnl_pct = round((entry_price - exit_price) / entry_price * 100, 3)
+
+    trade = {
+        "symbol": symbol,
+        "side": pos["side"],
+        "entryPrice": entry_price,
+        "exitPrice": exit_price,
+        "entryTime": pos["entryTime"],
+        "exitTime": now,
+        "pnlPct": pnl_pct,
+        "reason": reason,
+    }
+    strat_state["closedTrades"].append(trade)
+    _record_daily_stats(strat_state, trade)
+    log.info(
+        "PAPER BOT [%s]: closed %s %s @ %s (entry %s) pnl=%.3f%% (%s)",
+        strategy_key, pos["side"], symbol, exit_price, entry_price, pnl_pct, reason,
+    )
+    return trade
+
+
+def _position_snapshot(pos, ltp, extra=None):
+    if not pos:
+        return None
+    entry_price = pos["entryPrice"]
+    if pos["side"] == "LONG":
+        unrealized = round((ltp - entry_price) / entry_price * 100, 3)
+    else:
+        unrealized = round((entry_price - ltp) / entry_price * 100, 3)
+    snap = {"side": pos["side"], "entryPrice": entry_price, "unrealizedPnlPct": unrealized}
+    if extra:
+        snap.update(extra)
+    return snap
+
+
+def _run_base_strategy(strat_state, symbol, item, now):
+    """All 4 base indicators green -> LONG, all red -> SHORT. Exit the
+    instant any ONE of the four flips against the open position."""
+    positions = strat_state["positions"]
+    pos = positions.get(symbol)
+    ltp = item["ltp"]
+
+    if pos is None:
+        if _all_green(item):
+            positions[symbol] = {"side": "LONG", "entryPrice": ltp, "entryTime": now}
+        elif ALLOW_SHORTS and _all_red(item):
+            positions[symbol] = {"side": "SHORT", "entryPrice": ltp, "entryTime": now}
+    else:
+        exit_reason = None
+        if pos["side"] == "LONG" and not _all_green(item):
+            exit_reason = "an indicator turned red"
+        elif pos["side"] == "SHORT" and not _all_red(item):
+            exit_reason = "an indicator turned green"
+        if exit_reason:
+            _close_trade("base", strat_state, symbol, pos, ltp, exit_reason, now)
+            del positions[symbol]
+
+    return _position_snapshot(positions.get(symbol), ltp)
+
+
+def _run_smc_strategy(strat_state, symbol, item, now):
+    """Opens off the 5M SMC trade setup (nearest unmitigated OB/FVG zone,
+    or a confirmed QML) at the live price, carrying over that setup's own
+    stop-loss/target. Exits when price actually hits either — a real
+    trade-management exit, unlike the flip-based exits of the other two
+    strategies."""
+    positions = strat_state["positions"]
+    pos = positions.get(symbol)
+    ltp = item["ltp"]
+    setup = ((item.get("smc") or {}).get("5m") or {}).get("tradeSetup")
+
+    if pos is None:
+        if setup:
+            side = "LONG" if setup["type"] == "bullish" else "SHORT"
+            positions[symbol] = {
+                "side": side,
+                "entryPrice": ltp,
+                "entryTime": now,
+                "stopLoss": setup["stopLoss"],
+                "target": setup["target"],
+                "source": setup["source"],
+            }
+    else:
+        exit_reason = None
+        if pos["side"] == "LONG":
+            if ltp <= pos["stopLoss"]:
+                exit_reason = "hit stop loss"
+            elif ltp >= pos["target"]:
+                exit_reason = "hit target"
+        else:
+            if ltp >= pos["stopLoss"]:
+                exit_reason = "hit stop loss"
+            elif ltp <= pos["target"]:
+                exit_reason = "hit target"
+        if exit_reason:
+            _close_trade("smc", strat_state, symbol, pos, ltp, exit_reason, now)
+            del positions[symbol]
+
+    pos = positions.get(symbol)
+    extra = {"source": pos["source"]} if pos else None
+    return _position_snapshot(pos, ltp, extra=extra)
+
+
+def _run_mtf_strategy(strat_state, symbol, item, now):
+    """Opens when the 5M+15M+1H multi-timeframe signal agrees (BUY/SELL).
+    Exits the instant that agreement breaks (signal no longer matches the
+    side that was entered)."""
+    positions = strat_state["positions"]
+    pos = positions.get(symbol)
+    ltp = item["ltp"]
+    mtf_signal = item.get("mtfSignal", "NEUTRAL")
+
+    if pos is None:
+        if mtf_signal == "BUY":
+            positions[symbol] = {"side": "LONG", "entryPrice": ltp, "entryTime": now}
+        elif ALLOW_SHORTS and mtf_signal == "SELL":
+            positions[symbol] = {"side": "SHORT", "entryPrice": ltp, "entryTime": now}
+    else:
+        exit_reason = None
+        if pos["side"] == "LONG" and mtf_signal != "BUY":
+            exit_reason = "MTF signal no longer BUY"
+        elif pos["side"] == "SHORT" and mtf_signal != "SELL":
+            exit_reason = "MTF signal no longer SELL"
+        if exit_reason:
+            _close_trade("mtf", strat_state, symbol, pos, ltp, exit_reason, now)
+            del positions[symbol]
+
+    return _position_snapshot(positions.get(symbol), ltp)
+
+
+STRATEGY_RUNNERS = {
+    "base": _run_base_strategy,
+    "smc": _run_smc_strategy,
+    "mtf": _run_mtf_strategy,
+}
+
+
+def process_cycle(results):
+    """Run all three strategies over this cycle's {symbol: item} results.
+    Mutates each item to add item['paperPositions'] = {'base':.., 'smc':..,
+    'mtf':..} (each None when flat on that strategy). Persists all state in
+    one write. A failure in one strategy on one symbol is logged and just
+    leaves that symbol's position untouched this cycle — it can't corrupt
+    the other strategies or symbols."""
+    state = read_state()
+    now = time.time()
+
+    for symbol, item in results.items():
+        snapshots = {}
+        for key, runner in STRATEGY_RUNNERS.items():
+            try:
+                snapshots[key] = runner(state["strategies"][key], symbol, item, now)
+            except Exception as e:
+                log.warning("Paper bot [%s] failed on %s: %s", key, symbol, e)
+                snapshots[key] = None
+        item["paperPositions"] = snapshots
+
+    for key in STRATEGIES:
+        closed = state["strategies"][key]["closedTrades"]
+        if len(closed) > MAX_CLOSED_TRADES:
+            state["strategies"][key]["closedTrades"] = closed[-MAX_CLOSED_TRADES:]
+
+    write_state(state)
+    return state
+
+
+def get_stats(strat_state):
+    """Summary stats over one strategy's closed-trade log."""
+    closed = strat_state.get("closedTrades", [])
+    total = len(closed)
+    wins = sum(1 for t in closed if t["pnlPct"] > 0)
+    losses = total - wins
+    total_pnl = round(sum(t["pnlPct"] for t in closed), 3)
+    avg_pnl = round(total_pnl / total, 3) if total else 0.0
+    win_rate = round(wins / total * 100, 1) if total else 0.0
+    return {
+        "totalTrades": total,
+        "wins": wins,
+        "losses": losses,
+        "winRatePct": win_rate,
+        "totalPnlPct": total_pnl,
+        "avgPnlPct": avg_pnl,
+    }
+
+
+def get_daily_summaries(strat_state, limit=30):
+    """Most recent `limit` days' P&L for one strategy, newest first."""
+    daily = strat_state.get("dailyStats", {})
     out = []
     for day_key in sorted(daily.keys(), reverse=True)[:limit]:
         d = daily[day_key]
@@ -119,103 +317,19 @@ def get_daily_summaries(state=None, limit=30):
     return out
 
 
-def process_cycle(results):
-    """Call once per refresh cycle with the {symbol: item} dict just
-    fetched. Mutates each item in place to add a 'paperPosition' field
-    (None when flat), updates/persists open positions and the closed-trade
-    log, and returns the state that was written."""
-    state = read_state()
-    positions = state.get("positions", {})
-    closed = state.get("closedTrades", [])
-    now = time.time()
-
-    for symbol, item in results.items():
-        pos = positions.get(symbol)
-        ltp = item["ltp"]
-
-        if pos is None:
-            if _all_green(item):
-                pos = {"side": "LONG", "entryPrice": ltp, "entryTime": now}
-                positions[symbol] = pos
-                log.info("PAPER BOT: opened LONG %s @ %s (all indicators green)", symbol, ltp)
-            elif ALLOW_SHORTS and _all_red(item):
-                pos = {"side": "SHORT", "entryPrice": ltp, "entryTime": now}
-                positions[symbol] = pos
-                log.info("PAPER BOT: opened SHORT %s @ %s (all indicators red)", symbol, ltp)
-        else:
-            exit_reason = None
-            if pos["side"] == "LONG" and not _all_green(item):
-                exit_reason = "an indicator turned red"
-            elif pos["side"] == "SHORT" and not _all_red(item):
-                exit_reason = "an indicator turned green"
-
-            if exit_reason:
-                entry_price = pos["entryPrice"]
-                if pos["side"] == "LONG":
-                    pnl_pct = round((ltp - entry_price) / entry_price * 100, 3)
-                else:
-                    pnl_pct = round((entry_price - ltp) / entry_price * 100, 3)
-
-                closed.append({
-                    "symbol": symbol,
-                    "side": pos["side"],
-                    "entryPrice": entry_price,
-                    "exitPrice": ltp,
-                    "entryTime": pos["entryTime"],
-                    "exitTime": now,
-                    "pnlPct": pnl_pct,
-                    "reason": exit_reason,
-                })
-                _record_daily_stats(state, closed[-1])
-                log.info(
-                    "PAPER BOT: closed %s %s @ %s (entry %s) pnl=%.3f%% (%s)",
-                    pos["side"], symbol, ltp, entry_price, pnl_pct, exit_reason,
-                )
-                del positions[symbol]
-                pos = None
-
-        if pos:
-            entry_price = pos["entryPrice"]
-            if pos["side"] == "LONG":
-                unrealized = round((ltp - entry_price) / entry_price * 100, 3)
-            else:
-                unrealized = round((entry_price - ltp) / entry_price * 100, 3)
-            item["paperPosition"] = {
-                "side": pos["side"],
-                "entryPrice": entry_price,
-                "unrealizedPnlPct": unrealized,
-            }
-        else:
-            item["paperPosition"] = None
-
-    if len(closed) > MAX_CLOSED_TRADES:
-        closed = closed[-MAX_CLOSED_TRADES:]
-
-    state = {
-        "positions": positions,
-        "closedTrades": closed,
-        "dailyStats": state.get("dailyStats", {}),
-    }
-    write_state(state)
-    return state
-
-
-def get_stats(state=None):
-    """Summary stats over the closed-trade log."""
+def get_full_report(state=None):
+    """Everything the frontend needs for all three strategies in one call:
+    {"base": {...}, "smc": {...}, "mtf": {...}}, each with openPositions,
+    the most recent closed trades, overall stats, and daily summaries."""
     if state is None:
         state = read_state()
-    closed = state.get("closedTrades", [])
-    total = len(closed)
-    wins = sum(1 for t in closed if t["pnlPct"] > 0)
-    losses = total - wins
-    total_pnl = round(sum(t["pnlPct"] for t in closed), 3)
-    avg_pnl = round(total_pnl / total, 3) if total else 0.0
-    win_rate = round(wins / total * 100, 1) if total else 0.0
-    return {
-        "totalTrades": total,
-        "wins": wins,
-        "losses": losses,
-        "winRatePct": win_rate,
-        "totalPnlPct": total_pnl,
-        "avgPnlPct": avg_pnl,
-    }
+    report = {}
+    for key in STRATEGIES:
+        strat_state = state["strategies"][key]
+        report[key] = {
+            "openPositions": strat_state.get("positions", {}),
+            "closedTrades": strat_state.get("closedTrades", [])[-50:],
+            "stats": get_stats(strat_state),
+            "dailySummaries": get_daily_summaries(strat_state, limit=30),
+        }
+    return report
