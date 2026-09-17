@@ -432,16 +432,11 @@ def get_status():
 
 @app.route("/api/paper-trades", methods=["GET"])
 def get_paper_trades():
-    """Paper trading bot state: currently open (simulated) positions, the
-    most recent closed trades, overall stats, and a day-by-day (IST) P&L
-    summary. No real orders are ever placed — this is simulation only."""
-    state = paper_trader.read_state()
-    return jsonify({
-        "openPositions": state.get("positions", {}),
-        "closedTrades": state.get("closedTrades", [])[-50:],
-        "stats": paper_trader.get_stats(state),
-        "dailySummaries": paper_trader.get_daily_summaries(state, limit=30),
-    })
+    """Paper trading bot report for all three strategies (base/smc/mtf):
+    each with its currently open (simulated) positions, most recent closed
+    trades, overall stats, and a day-by-day (IST) P&L summary. No real
+    orders are ever placed — this is simulation only."""
+    return jsonify(paper_trader.get_full_report())
 
 
 # ----------------------------------------------------------------------------
