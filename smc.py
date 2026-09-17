@@ -223,11 +223,102 @@ def _find_qml(df, swings, bullish=True, max_p1_checked=100):
     return None
 
 
-def compute_smc_for_df(df):
-    """Run OB/FVG/QML detection on a single-timeframe OHLCV dataframe."""
+def _stop_buffer(price):
+    """Small buffer placed just beyond a zone edge for the stop loss, so the
+    stop isn't sitting exactly on the line that defines the zone."""
+    return max(price * 0.0005, 0.0001)
+
+
+def compute_smc_trade_setup(smc_result, ltp):
+    """Combine unmitigated OB zones, unmitigated FVG zones, and a confirmed
+    QML into ONE actionable entry/stop-loss/target for this timeframe.
+
+    Logic: a bullish zone sitting at-or-below price is potential support (a
+    long entry on a pullback into it); a bearish zone at-or-above price is
+    potential resistance (a short entry on a pullback into it). Whichever
+    zone's near edge is closest to the live price wins — that's the most
+    immediately relevant setup. Target uses a 1:2 reward:risk off that zone,
+    matching the convention already used by the EMA-based signal.
+    Returns None when there's no zone to trade off on this timeframe.
+    """
+    bullish, bearish = [], []
+
+    for ob in smc_result.get("orderBlocks", []):
+        if not ob["mitigated"]:
+            (bullish if ob["type"] == "bullish" else bearish).append(
+                {"top": ob["top"], "bottom": ob["bottom"], "source": "OB"}
+            )
+
+    for fvg in smc_result.get("fvg", []):
+        if not fvg["mitigated"]:
+            (bullish if fvg["type"] == "bullish" else bearish).append(
+                {"top": fvg["top"], "bottom": fvg["bottom"], "source": "FVG"}
+            )
+
+    qml_b = smc_result.get("qmlBullish")
+    if qml_b and qml_b["status"] == "confirmed":
+        bullish.append({"top": qml_b["zone"][1], "bottom": qml_b["zone"][0], "source": "QML"})
+
+    qml_s = smc_result.get("qmlBearish")
+    if qml_s and qml_s["status"] == "confirmed":
+        bearish.append({"top": qml_s["zone"][1], "bottom": qml_s["zone"][0], "source": "QML"})
+
+    # Only zones on the "right side" of price count: support must be at or
+    # below price, resistance at or above (a 0.1% tolerance lets a zone the
+    # price is currently sitting inside still qualify).
+    supports = [z for z in bullish if z["top"] <= ltp * 1.001]
+    resistances = [z for z in bearish if z["bottom"] >= ltp * 0.999]
+
+    def nearest(zones):
+        if not zones:
+            return None
+        return min(zones, key=lambda z: abs(ltp - (z["top"] + z["bottom"]) / 2))
+
+    best_support = nearest(supports)
+    best_resistance = nearest(resistances)
+    buffer = _stop_buffer(ltp)
+
+    support_dist = abs(ltp - best_support["top"]) if best_support else None
+    resistance_dist = abs(ltp - best_resistance["bottom"]) if best_resistance else None
+
+    if best_support and (resistance_dist is None or support_dist <= resistance_dist):
+        entry = round(best_support["top"], 2)
+        stop = round(best_support["bottom"] - buffer, 2)
+        risk = entry - stop
+        if risk <= 0:
+            return None
+        return {
+            "type": "bullish",
+            "source": best_support["source"],
+            "entry": entry,
+            "stopLoss": stop,
+            "target": round(entry + risk * 2, 2),
+        }
+
+    if best_resistance:
+        entry = round(best_resistance["bottom"], 2)
+        stop = round(best_resistance["top"] + buffer, 2)
+        risk = stop - entry
+        if risk <= 0:
+            return None
+        return {
+            "type": "bearish",
+            "source": best_resistance["source"],
+            "entry": entry,
+            "stopLoss": stop,
+            "target": round(entry - risk * 2, 2),
+        }
+
+    return None
+
+
+def compute_smc_for_df(df, ltp):
+    """Run OB/FVG/QML detection on a single-timeframe OHLCV dataframe, plus
+    the combined trade setup derived from those zones."""
     min_bars = SWING_LEFT + SWING_RIGHT + 6
+    empty = {"orderBlocks": [], "fvg": [], "qmlBullish": None, "qmlBearish": None, "tradeSetup": None}
     if len(df) < min_bars:
-        return {"orderBlocks": [], "fvg": [], "qmlBullish": None, "qmlBearish": None}
+        return empty
 
     if len(df) > MAX_BARS_FOR_SMC:
         df = df.iloc[-MAX_BARS_FOR_SMC:]
@@ -235,28 +326,31 @@ def compute_smc_for_df(df):
     d = detect_swings(df.copy())
     swings = _swings_list(d)
 
-    return {
+    result = {
         "orderBlocks": detect_order_blocks(d, swings),
         "fvg": detect_fvg(d),
         "qmlBullish": _find_qml(d, swings, bullish=True),
         "qmlBearish": _find_qml(d, swings, bullish=False),
     }
+    result["tradeSetup"] = compute_smc_trade_setup(result, ltp)
+    return result
 
 
-def compute_smc_all_timeframes(df_5m, symbol_name="?"):
+def compute_smc_all_timeframes(df_5m, ltp, symbol_name="?"):
     """Resample the base 5-minute dataframe to every timeframe in TF_RULES
-    and run SMC detection on each. Never raises — a failure on one
-    timeframe just yields empty results for that timeframe so one bad
-    symbol/timeframe can't take down the whole refresh cycle."""
+    and run SMC detection (+ trade setup) on each, using the same live
+    price for all of them. Never raises — a failure on one timeframe just
+    yields empty results for that timeframe so one bad symbol/timeframe
+    can't take down the whole refresh cycle."""
     result = {}
     base = df_5m[["Open", "High", "Low", "Close", "Volume"]]
 
     for tf, rule in TF_RULES.items():
         try:
             tf_df = base if rule is None else resample_ohlc(base, rule)
-            result[tf] = compute_smc_for_df(tf_df)
+            result[tf] = compute_smc_for_df(tf_df, ltp)
         except Exception as e:
             log.warning("%s: SMC computation failed on tf=%s: %s", symbol_name, tf, e)
-            result[tf] = {"orderBlocks": [], "fvg": [], "qmlBullish": None, "qmlBearish": None}
+            result[tf] = {"orderBlocks": [], "fvg": [], "qmlBullish": None, "qmlBearish": None, "tradeSetup": None}
 
     return result
