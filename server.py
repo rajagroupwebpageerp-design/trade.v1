@@ -12,7 +12,8 @@ from curl_cffi import requests as curl_requests
 from flask import Flask, jsonify
 from flask_cors import CORS
 
-from smc import compute_smc_all_timeframes
+from smc import compute_smc_all_timeframes, resample_ohlc
+import paper_trader
 
 # ----------------------------------------------------------------------------
 # Logging setup — this is the #1 fix. The old code used bare print() inside a
@@ -171,6 +172,39 @@ def calculate_indicators(df):
     return df
 
 
+def get_timeframe_bias(tf_df):
+    """Run the exact same EMA(9/21)/RSI/MACD/VWAP confluence rule used for
+    the main 5M signal, but on a (possibly resampled) higher-timeframe
+    dataframe. Returns 'bullish', 'bearish', or 'neutral' — 'neutral' also
+    covers not-enough-data / still-warming-up cases, since a higher
+    timeframe simply not agreeing with 5M should never itself be treated
+    as an error."""
+    if len(tf_df) < 26:
+        return "neutral"
+
+    tf_df = calculate_indicators(tf_df.copy())
+    latest = tf_df.iloc[-1]
+
+    ema9 = latest["EMA9"]
+    ema21 = latest["EMA21"]
+    rsi = latest["RSI"]
+    macd = latest["MACD"]
+    macd_signal = latest["MACD_Signal"]
+    close = latest["Close"]
+    vwap = latest["VWAP"]
+
+    if any(np.isnan(x) for x in [ema9, ema21, rsi, macd, macd_signal]):
+        return "neutral"
+
+    vwap_val = vwap if not np.isnan(vwap) else ema21
+
+    if ema9 > ema21 and close > vwap_val and rsi > 52 and macd > macd_signal:
+        return "bullish"
+    if ema9 < ema21 and close < vwap_val and rsi < 48 and macd < macd_signal:
+        return "bearish"
+    return "neutral"
+
+
 def fetch_one(name, ticker, category, session):
     """Fetch + compute indicators for a single symbol. Returns a result dict
     or None. Logs the reason on every failure path so nothing fails silently."""
@@ -205,9 +239,13 @@ def fetch_one(name, ticker, category, session):
         # Run SMC detection on the raw, unmodified OHLCV bars BEFORE
         # calculate_indicators() adds its own columns — SMC only needs
         # Open/High/Low/Close/Volume, and computing it first keeps the two
-        # concerns cleanly separated.
+        # concerns cleanly separated. The SMC trade-setup logic needs the
+        # live price to know which zones sit above/below it, so we pull
+        # that from the raw Close here (calculate_indicators never touches
+        # Close, so this matches the ltp computed further down exactly).
+        raw_ltp = round(float(df["Close"].iloc[-1]), 2)
         try:
-            smc_data = compute_smc_all_timeframes(df, symbol_name=name)
+            smc_data = compute_smc_all_timeframes(df, raw_ltp, symbol_name=name)
         except Exception as e:
             log.warning("%s (%s): SMC computation failed entirely: %s", name, ticker, e)
             smc_data = {}
@@ -250,6 +288,27 @@ def fetch_one(name, ticker, category, session):
 
         log.info("%s (%s): OK ltp=%s signal=%s", name, ticker, ltp, signal)
 
+        # Multi-timeframe confirmation: check the SAME EMA/RSI/MACD/VWAP
+        # confluence rule on 15M and 1H (resampled from these same 5M bars,
+        # so no extra Yahoo requests), and only call it a confirmed BUY/SELL
+        # when all three timeframes agree. This is separate from `signal`
+        # above (which stays 5M-only) so both can be shown side by side.
+        bias_5m = "bullish" if signal == "BUY" else ("bearish" if signal == "SELL" else "neutral")
+        try:
+            ohlcv = df[["Open", "High", "Low", "Close", "Volume"]]
+            bias_15m = get_timeframe_bias(resample_ohlc(ohlcv, "15min"))
+            bias_1h = get_timeframe_bias(resample_ohlc(ohlcv, "60min"))
+        except Exception as e:
+            log.warning("%s (%s): MTF bias computation failed: %s", name, ticker, e)
+            bias_15m, bias_1h = "neutral", "neutral"
+
+        if bias_5m == "bullish" and bias_15m == "bullish" and bias_1h == "bullish":
+            mtf_signal = "BUY"
+        elif bias_5m == "bearish" and bias_15m == "bearish" and bias_1h == "bearish":
+            mtf_signal = "SELL"
+        else:
+            mtf_signal = "NEUTRAL"
+
         return {
             "category": category,
             "ltp": ltp,
@@ -263,6 +322,8 @@ def fetch_one(name, ticker, category, session):
             "sl": sl,
             "target": target,
             "smc": smc_data,
+            "mtfSignal": mtf_signal,
+            "mtfBias": {"5m": bias_5m, "15m": bias_15m, "1h": bias_1h},
         }, None
 
     except Exception as e:
@@ -298,6 +359,16 @@ def refresh_cache():
         total = len(SYMBOLS)
 
         if results:
+            # Run the paper trading bot BEFORE caching: it mutates each
+            # item in place to attach a 'paperPosition' field (open
+            # position + unrealized PnL, or None when flat), and persists
+            # any new entries/exits to its own state file. Failure here
+            # should never take down the main data refresh.
+            try:
+                paper_trader.process_cycle(results)
+            except Exception as e:
+                log.warning("Paper trading bot update failed: %s", e)
+
             # Keep serving the last good cache if this cycle produced
             # nothing new — better a slightly stale table than a blank one.
             write_cache(data=results, last_error=None)
@@ -356,6 +427,20 @@ def get_status():
         "symbols_expected": len(SYMBOLS),
         "last_error": cache["last_error"],
         "served_by_pid": os.getpid(),
+    })
+
+
+@app.route("/api/paper-trades", methods=["GET"])
+def get_paper_trades():
+    """Paper trading bot state: currently open (simulated) positions, the
+    most recent closed trades, overall stats, and a day-by-day (IST) P&L
+    summary. No real orders are ever placed — this is simulation only."""
+    state = paper_trader.read_state()
+    return jsonify({
+        "openPositions": state.get("positions", {}),
+        "closedTrades": state.get("closedTrades", [])[-50:],
+        "stats": paper_trader.get_stats(state),
+        "dailySummaries": paper_trader.get_daily_summaries(state, limit=30),
     })
 
 
