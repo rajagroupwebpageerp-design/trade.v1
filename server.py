@@ -12,6 +12,8 @@ from curl_cffi import requests as curl_requests
 from flask import Flask, jsonify
 from flask_cors import CORS
 
+from smc import compute_smc_all_timeframes
+
 # ----------------------------------------------------------------------------
 # Logging setup — this is the #1 fix. The old code used bare print() inside a
 # try/except, but empty dataframes from yfinance don't raise exceptions, so
@@ -96,6 +98,13 @@ CACHE_WRITE_LOCK = threading.Lock()  # only guards this process's own writes
 REFRESH_INTERVAL_SECONDS = 45   # how often we hit Yahoo for fresh data
 PER_SYMBOL_DELAY_SECONDS = 0.4  # small stagger so 18 calls don't fire as a burst
 
+# 5-minute bars are the base timeframe for everything, including SMC: higher
+# timeframes (15m/1h/4h/1d) are built by resampling this same dataframe, so
+# we only ever make ONE Yahoo request per symbol per cycle regardless of how
+# many timeframes we analyze. 60d is Yahoo's maximum lookback for 5m bars,
+# and gives enough daily candles for the 1D SMC view to be meaningful.
+HISTORY_PERIOD = "60d"
+
 
 def read_cache():
     """Read the shared cache file. Safe to call from any worker process."""
@@ -167,29 +176,41 @@ def fetch_one(name, ticker, category, session):
     or None. Logs the reason on every failure path so nothing fails silently."""
     try:
         stock = yf.Ticker(ticker, session=session)
-        # Pull several days of 5-minute bars, not just "today". EMA/RSI/MACD
+        # Pull several weeks of 5-minute bars, not just "today". EMA/RSI/MACD
         # need ~26 bars of warm-up; at 5-minute bars that's ~2+ hours, so a
         # period="1d" fetch has NO valid signal for the first couple of
         # hours after market open every single day. Pulling prior days'
         # bars lets the indicators warm up using yesterday's data, so
         # today's very first bars already have valid EMA/RSI/MACD values.
-        # VWAP is unaffected — calculate_indicators() resets it per calendar
-        # day regardless of how many days of history we pass in.
-        df = stock.history(period="5d", interval="5m")
+        # It also gives the SMC (OB/FVG/QML) detection enough bars to build
+        # meaningful 15m/1h/4h/1d structure via resampling, without any
+        # extra Yahoo requests. VWAP is unaffected — calculate_indicators()
+        # resets it per calendar day regardless of how many days we pass in.
+        df = stock.history(period=HISTORY_PERIOD, interval="5m")
 
         if df.empty:
             log.warning("%s (%s): yfinance returned an EMPTY dataframe (hard failure)", name, ticker)
             return None, "hard_failure"
 
         if len(df) < 26:
-            # With a 5-day window this should be rare (e.g. a symbol with a
+            # With a 60-day window this should be rare (e.g. a symbol with a
             # very short trading history, or a market holiday gap). This is
             # NOT the same as Yahoo blocking us, so it's tracked separately.
             log.warning(
-                "%s (%s): only %d bars available even with 5d window, need >= 26",
-                name, ticker, len(df),
+                "%s (%s): only %d bars available even with %s window, need >= 26",
+                name, ticker, len(df), HISTORY_PERIOD,
             )
             return None, "insufficient_data"
+
+        # Run SMC detection on the raw, unmodified OHLCV bars BEFORE
+        # calculate_indicators() adds its own columns — SMC only needs
+        # Open/High/Low/Close/Volume, and computing it first keeps the two
+        # concerns cleanly separated.
+        try:
+            smc_data = compute_smc_all_timeframes(df, symbol_name=name)
+        except Exception as e:
+            log.warning("%s (%s): SMC computation failed entirely: %s", name, ticker, e)
+            smc_data = {}
 
         df = calculate_indicators(df)
         latest = df.iloc[-1]
@@ -241,6 +262,7 @@ def fetch_one(name, ticker, category, session):
             "entry": entry,
             "sl": sl,
             "target": target,
+            "smc": smc_data,
         }, None
 
     except Exception as e:
