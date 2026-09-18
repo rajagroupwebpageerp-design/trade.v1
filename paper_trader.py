@@ -482,15 +482,71 @@ STRATEGY_RUNNERS = {
 }
 
 
+def _log_diagnostics(results):
+    """One line per cycle showing how many symbols currently satisfy each
+    INDIVIDUAL condition the stricter strategies require. This turns 'why
+    is confluence/strict/quality not firing' from a guess into something
+    checkable in the Render logs — whichever count is near zero is the
+    actual bottleneck, not a bug to hunt for blindly."""
+    all_green = all_red = 0
+    bull_ob = bull_fvg = bear_ob = bear_fvg = 0
+    mtf_buy = mtf_sell = 0
+    setup_bull = setup_bear = 0
+
+    for item in results.values():
+        if _all_green(item):
+            all_green += 1
+        if _all_red(item):
+            all_red += 1
+
+        smc_5m = ((item.get("smc") or {}).get("5m")) or {}
+        obs = smc_5m.get("orderBlocks", [])
+        fvgs = smc_5m.get("fvg", [])
+        if _has_unmitigated(obs, "bullish"):
+            bull_ob += 1
+        if _has_unmitigated(fvgs, "bullish"):
+            bull_fvg += 1
+        if _has_unmitigated(obs, "bearish"):
+            bear_ob += 1
+        if _has_unmitigated(fvgs, "bearish"):
+            bear_fvg += 1
+
+        if item.get("mtfSignal") == "BUY":
+            mtf_buy += 1
+        elif item.get("mtfSignal") == "SELL":
+            mtf_sell += 1
+
+        setup = smc_5m.get("tradeSetup")
+        if setup and setup.get("type") == "bullish":
+            setup_bull += 1
+        elif setup and setup.get("type") == "bearish":
+            setup_bear += 1
+
+    total = len(results)
+    log.info(
+        "PAPER BOT DIAGNOSTICS (of %d symbols): all-green=%d all-red=%d | "
+        "unmit-bull-OB=%d unmit-bull-FVG=%d unmit-bear-OB=%d unmit-bear-FVG=%d | "
+        "MTF-BUY=%d MTF-SELL=%d | smc-setup-bull=%d smc-setup-bear=%d",
+        total, all_green, all_red, bull_ob, bull_fvg, bear_ob, bear_fvg,
+        mtf_buy, mtf_sell, setup_bull, setup_bear,
+    )
+
+
 def process_cycle(results):
-    """Run all three strategies over this cycle's {symbol: item} results.
+    """Run all six strategies over this cycle's {symbol: item} results.
     Mutates each item to add item['paperPositions'] = {'base':.., 'smc':..,
-    'mtf':..} (each None when flat on that strategy). Persists all state in
-    one write. A failure in one strategy on one symbol is logged and just
-    leaves that symbol's position untouched this cycle — it can't corrupt
-    the other strategies or symbols."""
+    'mtf':.., 'confluence':.., 'strict':.., 'quality':..} (each None when
+    flat on that strategy). Persists all state in one write. A failure in
+    one strategy on one symbol is logged and just leaves that symbol's
+    position untouched this cycle — it can't corrupt the other strategies
+    or symbols."""
     state = read_state()
     now = time.time()
+
+    try:
+        _log_diagnostics(results)
+    except Exception as e:
+        log.warning("Paper bot diagnostics failed: %s", e)
 
     for symbol, item in results.items():
         snapshots = {}
