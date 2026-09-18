@@ -1,18 +1,24 @@
 """
-paper_trader.py — simulated (no real orders) paper trading, run as THREE
+paper_trader.py — simulated (no real orders) paper trading, run as FOUR
 independent strategies so their P&L can be tracked and compared separately:
 
-  "base" — the original rule: ALL of EMA(9>21)/RSI/MACD/VWAP (5M) green
-           opens a LONG, all red opens a SHORT; exits the instant any ONE
-           of the four flips against the position.
-  "smc"  — opens off the 5M SMC trade setup (the nearest unmitigated OB/FVG
-           zone, or a confirmed QML) at the live price, using that setup's
-           own stop-loss/target; exits when price hits either.
-  "mtf"  — opens when the 5M+15M+1H multi-timeframe signal agrees (BUY or
-           SELL); exits the instant that agreement breaks.
+  "base"       — the original rule: ALL of EMA(9>21)/RSI/MACD/VWAP (5M)
+                 green opens a LONG, all red opens a SHORT; exits the
+                 instant any ONE of the four flips against the position.
+  "smc"        — opens off the 5M SMC trade setup (the nearest unmitigated
+                 OB/FVG zone, or a confirmed QML) at the live price, using
+                 that setup's own stop-loss/target; exits when price hits
+                 either.
+  "mtf"        — opens when the 5M+15M+1H multi-timeframe signal agrees
+                 (BUY or SELL); exits the instant that agreement breaks.
+  "confluence" — opens ONLY when the base indicators are all green/red AND
+                 an unmitigated OB AND an unmitigated FVG of the matching
+                 direction are all present together on 5M. Uses a fixed
+                 points-based stop-loss/target (not percentage, not zone-
+                 derived) — see CONFLUENCE_SL_POINTS / CONFLUENCE_TARGET_POINTS.
 
 Each strategy keeps its own open positions, closed-trade log, and daily
-(IST) P&L summary — all three persisted together in one shared JSON state
+(IST) P&L summary — all four persisted together in one shared JSON state
 file (same atomic-write pattern as the market data cache), so every
 gunicorn worker process sees the same state.
 """
@@ -33,10 +39,18 @@ PAPER_LOCK = threading.Lock()
 MAX_CLOSED_TRADES = 200      # per-strategy bounded log
 MAX_DAILY_SUMMARIES = 90     # per-strategy, roughly a trading quarter
 
-# Flip to False to go long-only across all three strategies.
+# Flip to False to go long-only across all strategies.
 ALLOW_SHORTS = True
 
-STRATEGIES = ["base", "smc", "mtf"]
+# Fixed price-POINTS (not %, not zone-based) for the "confluence" strategy's
+# stop-loss/target — 1:2 reward:risk as requested. NOTE: a flat point value
+# behaves very differently across assets at very different price scales
+# (e.g. 5 points is enormous for Natural Gas at ~₹2.91, tiny for an index in
+# the tens of thousands) — revisit if that turns out to be a problem.
+CONFLUENCE_SL_POINTS = 5
+CONFLUENCE_TARGET_POINTS = 10
+
+STRATEGIES = ["base", "smc", "mtf", "confluence"]
 
 # Fixed UTC+5:30 — India doesn't observe DST, so this is correct year-round
 # without needing the zoneinfo package. Used to group closed trades into
@@ -241,10 +255,62 @@ def _run_mtf_strategy(strat_state, symbol, item, now):
     return _position_snapshot(positions.get(symbol), ltp)
 
 
+def _has_unmitigated(zones, zone_type):
+    return any(z["type"] == zone_type and not z["mitigated"] for z in (zones or []))
+
+
+def _run_confluence_strategy(strat_state, symbol, item, now):
+    """Only enters when ALL base indicators are green/red AND an
+    unmitigated OB AND an unmitigated FVG of the matching direction are all
+    present together on 5M — a stricter combined confirmation than either
+    'base' or 'smc' alone. Fixed points-based SL/target (1:2)."""
+    positions = strat_state["positions"]
+    pos = positions.get(symbol)
+    ltp = item["ltp"]
+    smc_5m = ((item.get("smc") or {}).get("5m")) or {}
+    obs = smc_5m.get("orderBlocks", [])
+    fvgs = smc_5m.get("fvg", [])
+
+    if pos is None:
+        bullish_confluence = _all_green(item) and _has_unmitigated(obs, "bullish") and _has_unmitigated(fvgs, "bullish")
+        bearish_confluence = ALLOW_SHORTS and _all_red(item) and _has_unmitigated(obs, "bearish") and _has_unmitigated(fvgs, "bearish")
+
+        if bullish_confluence:
+            positions[symbol] = {
+                "side": "LONG", "entryPrice": ltp, "entryTime": now,
+                "stopLoss": round(ltp - CONFLUENCE_SL_POINTS, 2),
+                "target": round(ltp + CONFLUENCE_TARGET_POINTS, 2),
+            }
+        elif bearish_confluence:
+            positions[symbol] = {
+                "side": "SHORT", "entryPrice": ltp, "entryTime": now,
+                "stopLoss": round(ltp + CONFLUENCE_SL_POINTS, 2),
+                "target": round(ltp - CONFLUENCE_TARGET_POINTS, 2),
+            }
+    else:
+        exit_reason = None
+        if pos["side"] == "LONG":
+            if ltp <= pos["stopLoss"]:
+                exit_reason = "hit stop loss"
+            elif ltp >= pos["target"]:
+                exit_reason = "hit target"
+        else:
+            if ltp >= pos["stopLoss"]:
+                exit_reason = "hit stop loss"
+            elif ltp <= pos["target"]:
+                exit_reason = "hit target"
+        if exit_reason:
+            _close_trade("confluence", strat_state, symbol, pos, ltp, exit_reason, now)
+            del positions[symbol]
+
+    return _position_snapshot(positions.get(symbol), ltp)
+
+
 STRATEGY_RUNNERS = {
     "base": _run_base_strategy,
     "smc": _run_smc_strategy,
     "mtf": _run_mtf_strategy,
+    "confluence": _run_confluence_strategy,
 }
 
 
