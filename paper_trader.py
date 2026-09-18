@@ -1,5 +1,5 @@
 """
-paper_trader.py — simulated (no real orders) paper trading, run as FOUR
+paper_trader.py — simulated (no real orders) paper trading, run as FIVE
 independent strategies so their P&L can be tracked and compared separately:
 
   "base"       — the original rule: ALL of EMA(9>21)/RSI/MACD/VWAP (5M)
@@ -15,10 +15,17 @@ independent strategies so their P&L can be tracked and compared separately:
                  an unmitigated OB AND an unmitigated FVG of the matching
                  direction are all present together on 5M. Uses a fixed
                  points-based stop-loss/target (not percentage, not zone-
-                 derived) — see CONFLUENCE_SL_POINTS / CONFLUENCE_TARGET_POINTS.
+                 derived) — see FIXED_SL_POINTS / FIXED_TARGET_POINTS.
+  "strict"     — opens ONLY when ALL 7 conditions align: EMA, RSI, MACD,
+                 VWAP, Order Block, FVG, and QML (confirmed). Same fixed
+                 points SL/target as "confluence", but a smarter exit:
+                 holds through minor noise and only exits early — before
+                 price reaches SL/target — if MORE THAN 2 of the 7
+                 conditions flip against the position; otherwise it just
+                 waits for price to hit the stop-loss or target.
 
 Each strategy keeps its own open positions, closed-trade log, and daily
-(IST) P&L summary — all four persisted together in one shared JSON state
+(IST) P&L summary — all five persisted together in one shared JSON state
 file (same atomic-write pattern as the market data cache), so every
 gunicorn worker process sees the same state.
 """
@@ -42,15 +49,20 @@ MAX_DAILY_SUMMARIES = 90     # per-strategy, roughly a trading quarter
 # Flip to False to go long-only across all strategies.
 ALLOW_SHORTS = True
 
-# Fixed price-POINTS (not %, not zone-based) for the "confluence" strategy's
-# stop-loss/target — 1:2 reward:risk as requested. NOTE: a flat point value
-# behaves very differently across assets at very different price scales
-# (e.g. 5 points is enormous for Natural Gas at ~₹2.91, tiny for an index in
-# the tens of thousands) — revisit if that turns out to be a problem.
-CONFLUENCE_SL_POINTS = 5
-CONFLUENCE_TARGET_POINTS = 10
+# Fixed price-POINTS (not %, not zone-based) for the "confluence" and
+# "strict" strategies' stop-loss/target — 1:2 reward:risk as requested.
+# NOTE: a flat point value behaves very differently across assets at very
+# different price scales (e.g. 5 points is enormous for Natural Gas at
+# ~₹2.91, tiny for an index in the tens of thousands) — revisit if that
+# turns out to be a problem.
+FIXED_SL_POINTS = 5
+FIXED_TARGET_POINTS = 10
 
-STRATEGIES = ["base", "smc", "mtf", "confluence"]
+# "strict" exits early (before price reaches SL/target) once MORE than this
+# many of its 7 conditions flip against the open position.
+STRICT_MAX_FLIPPED = 2
+
+STRATEGIES = ["base", "smc", "mtf", "confluence", "strict"]
 
 # Fixed UTC+5:30 — India doesn't observe DST, so this is correct year-round
 # without needing the zoneinfo package. Used to group closed trades into
@@ -278,14 +290,14 @@ def _run_confluence_strategy(strat_state, symbol, item, now):
         if bullish_confluence:
             positions[symbol] = {
                 "side": "LONG", "entryPrice": ltp, "entryTime": now,
-                "stopLoss": round(ltp - CONFLUENCE_SL_POINTS, 2),
-                "target": round(ltp + CONFLUENCE_TARGET_POINTS, 2),
+                "stopLoss": round(ltp - FIXED_SL_POINTS, 2),
+                "target": round(ltp + FIXED_TARGET_POINTS, 2),
             }
         elif bearish_confluence:
             positions[symbol] = {
                 "side": "SHORT", "entryPrice": ltp, "entryTime": now,
-                "stopLoss": round(ltp + CONFLUENCE_SL_POINTS, 2),
-                "target": round(ltp - CONFLUENCE_TARGET_POINTS, 2),
+                "stopLoss": round(ltp + FIXED_SL_POINTS, 2),
+                "target": round(ltp - FIXED_TARGET_POINTS, 2),
             }
     else:
         exit_reason = None
@@ -306,11 +318,84 @@ def _run_confluence_strategy(strat_state, symbol, item, now):
     return _position_snapshot(positions.get(symbol), ltp)
 
 
+def _condition_flags(item, side):
+    """The 7 conditions (EMA, RSI, MACD, VWAP, OB, FVG, QML) as booleans:
+    True if that condition currently matches `side` ('LONG' expects every
+    condition bullish, 'SHORT' expects every condition bearish)."""
+    smc_5m = ((item.get("smc") or {}).get("5m")) or {}
+    obs = smc_5m.get("orderBlocks", [])
+    fvgs = smc_5m.get("fvg", [])
+    qml_b = smc_5m.get("qmlBullish")
+    qml_s = smc_5m.get("qmlBearish")
+
+    want_bullish = side == "LONG"
+    zone_type = "bullish" if want_bullish else "bearish"
+
+    return [
+        item["emaBullish"] if want_bullish else not item["emaBullish"],
+        (item["rsi"] > 52) if want_bullish else (item["rsi"] < 48),
+        item["macdBullish"] if want_bullish else not item["macdBullish"],
+        item["vwapAbove"] if want_bullish else not item["vwapAbove"],
+        _has_unmitigated(obs, zone_type),
+        _has_unmitigated(fvgs, zone_type),
+        bool(qml_b and qml_b["status"] == "confirmed") if want_bullish else bool(qml_s and qml_s["status"] == "confirmed"),
+    ]
+
+
+def _run_strict_strategy(strat_state, symbol, item, now):
+    """Enters only when ALL 7 conditions align. Same fixed points SL/target
+    as 'confluence', but holds through minor noise: exits early (before
+    price reaches SL/target) only once MORE than STRICT_MAX_FLIPPED of the
+    7 conditions flip against the position — otherwise just waits for
+    price to hit the stop-loss or target."""
+    positions = strat_state["positions"]
+    pos = positions.get(symbol)
+    ltp = item["ltp"]
+
+    if pos is None:
+        if all(_condition_flags(item, "LONG")):
+            positions[symbol] = {
+                "side": "LONG", "entryPrice": ltp, "entryTime": now,
+                "stopLoss": round(ltp - FIXED_SL_POINTS, 2),
+                "target": round(ltp + FIXED_TARGET_POINTS, 2),
+            }
+        elif ALLOW_SHORTS and all(_condition_flags(item, "SHORT")):
+            positions[symbol] = {
+                "side": "SHORT", "entryPrice": ltp, "entryTime": now,
+                "stopLoss": round(ltp + FIXED_SL_POINTS, 2),
+                "target": round(ltp - FIXED_TARGET_POINTS, 2),
+            }
+    else:
+        exit_reason = None
+        if pos["side"] == "LONG":
+            if ltp <= pos["stopLoss"]:
+                exit_reason = "hit stop loss"
+            elif ltp >= pos["target"]:
+                exit_reason = "hit target"
+        else:
+            if ltp >= pos["stopLoss"]:
+                exit_reason = "hit stop loss"
+            elif ltp <= pos["target"]:
+                exit_reason = "hit target"
+
+        if exit_reason is None:
+            false_count = _condition_flags(item, pos["side"]).count(False)
+            if false_count > STRICT_MAX_FLIPPED:
+                exit_reason = f"{false_count}/7 conditions flipped against position"
+
+        if exit_reason:
+            _close_trade("strict", strat_state, symbol, pos, ltp, exit_reason, now)
+            del positions[symbol]
+
+    return _position_snapshot(positions.get(symbol), ltp)
+
+
 STRATEGY_RUNNERS = {
     "base": _run_base_strategy,
     "smc": _run_smc_strategy,
     "mtf": _run_mtf_strategy,
     "confluence": _run_confluence_strategy,
+    "strict": _run_strict_strategy,
 }
 
 
