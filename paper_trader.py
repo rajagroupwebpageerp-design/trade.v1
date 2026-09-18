@@ -1,5 +1,5 @@
 """
-paper_trader.py — simulated (no real orders) paper trading, run as SIX
+paper_trader.py — simulated (no real orders) paper trading, run as SEVEN
 independent strategies so their P&L can be tracked and compared separately:
 
   "base"       — the original rule: ALL of EMA(9>21)/RSI/MACD/VWAP (5M)
@@ -32,9 +32,17 @@ independent strategies so their P&L can be tracked and compared separately:
                  losing trade so it doesn't immediately re-enter the same
                  failing setup. Designed to trade less often but with
                  fewer false signals than the others.
+  "precision"  — weighted multi-timeframe scoring across the same 7
+                 conditions (EMA, RSI, MACD, VWAP, OB, FVG, QML), each
+                 counted independently PER TIMEFRAME rather than requiring
+                 one collapsed verdict: 1H needs >=5/7 green (macro bias),
+                 15M needs >=6/7 green (intermediate momentum), 5M needs
+                 EXACTLY 7/7 green (execution trigger). All three must be
+                 true at once to enter. Same fixed 5/10 point SL/target as
+                 "confluence"/"strict".
 
 Each strategy keeps its own open positions, closed-trade log, and daily
-(IST) P&L summary — all six persisted together in one shared JSON state
+(IST) P&L summary — all seven persisted together in one shared JSON state
 file (same atomic-write pattern as the market data cache), so every
 gunicorn worker process sees the same state.
 """
@@ -82,7 +90,12 @@ QUALITY_ATR_TARGET_MULT = 3.0
 # the same failing setup.
 QUALITY_COOLDOWN_SECONDS = 900  # 15 minutes
 
-STRATEGIES = ["base", "smc", "mtf", "confluence", "strict", "quality"]
+# "precision" per-timeframe minimum green-condition counts (out of 7).
+PRECISION_MIN_1H = 5    # macro bias: at most 2 of 7 may fail
+PRECISION_MIN_15M = 6   # intermediate momentum: at most 1 of 7 may fail
+PRECISION_MIN_5M = 7    # execution trigger: exactly all 7 must be green
+
+STRATEGIES = ["base", "smc", "mtf", "confluence", "strict", "quality", "precision"]
 
 # Fixed UTC+5:30 — India doesn't observe DST, so this is correct year-round
 # without needing the zoneinfo package. Used to group closed trades into
@@ -472,6 +485,95 @@ def _run_quality_strategy(strat_state, symbol, item, now):
     return _position_snapshot(positions.get(symbol), ltp)
 
 
+def _seven_flags_for_tf(item, tf, side):
+    """The 7 conditions (EMA, RSI, MACD, VWAP, OB, FVG, QML) as booleans
+    for ONE specific timeframe ('5m', '15m', or '1h'), matching `side`
+    ('LONG' expects every condition bullish, 'SHORT' expects every
+    condition bearish). Any indicator that hasn't warmed up yet on that
+    timeframe (None) counts as a miss rather than raising — an
+    incomplete timeframe just fails to qualify, it never crashes the
+    strategy."""
+    want_bullish = side == "LONG"
+
+    ind = ((item.get("indicatorFlags") or {}).get(tf)) or {}
+    ema_bullish = ind.get("emaBullish")
+    macd_bullish = ind.get("macdBullish")
+    vwap_above = ind.get("vwapAbove")
+    rsi_val = ind.get("rsi")
+
+    ema_ok = bool(ema_bullish) if want_bullish else (ema_bullish is False)
+    macd_ok = bool(macd_bullish) if want_bullish else (macd_bullish is False)
+    vwap_ok = bool(vwap_above) if want_bullish else (vwap_above is False)
+    rsi_ok = (rsi_val is not None) and ((rsi_val > 52) if want_bullish else (rsi_val < 48))
+
+    smc_tf = ((item.get("smc") or {}).get(tf)) or {}
+    obs = smc_tf.get("orderBlocks", [])
+    fvgs = smc_tf.get("fvg", [])
+    qml_b = smc_tf.get("qmlBullish")
+    qml_s = smc_tf.get("qmlBearish")
+    zone_type = "bullish" if want_bullish else "bearish"
+
+    ob_ok = _has_unmitigated(obs, zone_type)
+    fvg_ok = _has_unmitigated(fvgs, zone_type)
+    qml_ok = bool(qml_b and qml_b.get("status") == "confirmed") if want_bullish else bool(qml_s and qml_s.get("status") == "confirmed")
+
+    return [ema_ok, rsi_ok, macd_ok, vwap_ok, ob_ok, fvg_ok, qml_ok]
+
+
+def _run_precision_strategy(strat_state, symbol, item, now):
+    """Weighted multi-timeframe scoring: counts how many of the 7
+    conditions are green on EACH of 1H/15M/5M independently, and requires
+    all three timeframe thresholds to pass simultaneously — 1H >= 5/7
+    (macro bias), 15M >= 6/7 (intermediate momentum), 5M == 7/7 exactly
+    (execution trigger). Same fixed-points SL/target as confluence/strict."""
+    positions = strat_state["positions"]
+    pos = positions.get(symbol)
+    ltp = item["ltp"]
+
+    if pos is None:
+        sides = ["LONG", "SHORT"] if ALLOW_SHORTS else ["LONG"]
+        for side in sides:
+            count_1h = sum(_seven_flags_for_tf(item, "1h", side))
+            count_15m = sum(_seven_flags_for_tf(item, "15m", side))
+            count_5m = sum(_seven_flags_for_tf(item, "5m", side))
+
+            if count_1h >= PRECISION_MIN_1H and count_15m >= PRECISION_MIN_15M and count_5m >= PRECISION_MIN_5M:
+                if side == "LONG":
+                    positions[symbol] = {
+                        "side": "LONG", "entryPrice": ltp, "entryTime": now,
+                        "stopLoss": round(ltp - FIXED_SL_POINTS, 2),
+                        "target": round(ltp + FIXED_TARGET_POINTS, 2),
+                    }
+                else:
+                    positions[symbol] = {
+                        "side": "SHORT", "entryPrice": ltp, "entryTime": now,
+                        "stopLoss": round(ltp + FIXED_SL_POINTS, 2),
+                        "target": round(ltp - FIXED_TARGET_POINTS, 2),
+                    }
+                log.info(
+                    "PAPER BOT [precision]: ENTRY ALERT %s %s @ %s (1H=%d/7 15M=%d/7 5M=%d/7)",
+                    side, symbol, ltp, count_1h, count_15m, count_5m,
+                )
+                break  # only one side can open per cycle
+    else:
+        exit_reason = None
+        if pos["side"] == "LONG":
+            if ltp <= pos["stopLoss"]:
+                exit_reason = "hit stop loss"
+            elif ltp >= pos["target"]:
+                exit_reason = "hit target"
+        else:
+            if ltp >= pos["stopLoss"]:
+                exit_reason = "hit stop loss"
+            elif ltp <= pos["target"]:
+                exit_reason = "hit target"
+        if exit_reason:
+            _close_trade("precision", strat_state, symbol, pos, ltp, exit_reason, now)
+            del positions[symbol]
+
+    return _position_snapshot(positions.get(symbol), ltp)
+
+
 STRATEGY_RUNNERS = {
     "base": _run_base_strategy,
     "smc": _run_smc_strategy,
@@ -479,6 +581,7 @@ STRATEGY_RUNNERS = {
     "confluence": _run_confluence_strategy,
     "strict": _run_strict_strategy,
     "quality": _run_quality_strategy,
+    "precision": _run_precision_strategy,
 }
 
 
