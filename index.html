@@ -146,6 +146,7 @@
         <button class="filter-btn bot-btn" onclick="setBotStrategy('confluence', this)">Confluence (Green+OB+FVG)</button>
         <button class="filter-btn bot-btn" onclick="setBotStrategy('strict', this)">Strict (All 7 + hold-through-2)</button>
         <button class="filter-btn bot-btn" onclick="setBotStrategy('quality', this)">Quality (Base+MTF+SMC, ATR, cooldown)</button>
+        <button class="filter-btn bot-btn" onclick="setBotStrategy('precision', this)">Precision (1H≥5/7, 15M≥6/7, 5M=7/7)</button>
     </div>
 
     <table>
@@ -237,6 +238,7 @@
             confluence: "Confluence (Green+OB+FVG)",
             strict: "Strict (All 7 + hold-through-2)",
             quality: "Quality (Base+MTF+SMC, ATR, cooldown)",
+            precision: "Precision (1H≥5/7, 15M≥6/7, 5M=7/7)",
         };
 
         function setFilter(category, button) {
