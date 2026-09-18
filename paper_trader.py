@@ -1,5 +1,5 @@
 """
-paper_trader.py — simulated (no real orders) paper trading, run as FIVE
+paper_trader.py — simulated (no real orders) paper trading, run as SIX
 independent strategies so their P&L can be tracked and compared separately:
 
   "base"       — the original rule: ALL of EMA(9>21)/RSI/MACD/VWAP (5M)
@@ -23,9 +23,18 @@ independent strategies so their P&L can be tracked and compared separately:
                  price reaches SL/target — if MORE THAN 2 of the 7
                  conditions flip against the position; otherwise it just
                  waits for price to hit the stop-loss or target.
+  "quality"    — the most selective strategy: requires triple confirmation
+                 to enter (base indicators AND MTF AND an SMC trade setup
+                 all agreeing), sizes its stop-loss/target off each
+                 symbol's own ATR(14) instead of a flat point value (so it
+                 scales correctly whether the asset trades at ₹3 or
+                 ₹24,000), and imposes a cooldown on a symbol after a
+                 losing trade so it doesn't immediately re-enter the same
+                 failing setup. Designed to trade less often but with
+                 fewer false signals than the others.
 
 Each strategy keeps its own open positions, closed-trade log, and daily
-(IST) P&L summary — all five persisted together in one shared JSON state
+(IST) P&L summary — all six persisted together in one shared JSON state
 file (same atomic-write pattern as the market data cache), so every
 gunicorn worker process sees the same state.
 """
@@ -62,7 +71,18 @@ FIXED_TARGET_POINTS = 10
 # many of its 7 conditions flip against the open position.
 STRICT_MAX_FLIPPED = 2
 
-STRATEGIES = ["base", "smc", "mtf", "confluence", "strict"]
+# "quality" sizes its stop-loss/target off ATR(14) instead of flat points —
+# scales correctly across assets at very different price scales. Multiples
+# keep the same 1:2 reward:risk as the other fixed-points strategies.
+QUALITY_ATR_SL_MULT = 1.5
+QUALITY_ATR_TARGET_MULT = 3.0
+
+# After a losing "quality" trade, that symbol is skipped for this many
+# seconds before a new entry is allowed — stops immediately re-entering
+# the same failing setup.
+QUALITY_COOLDOWN_SECONDS = 900  # 15 minutes
+
+STRATEGIES = ["base", "smc", "mtf", "confluence", "strict", "quality"]
 
 # Fixed UTC+5:30 — India doesn't observe DST, so this is correct year-round
 # without needing the zoneinfo package. Used to group closed trades into
@@ -75,7 +95,7 @@ def _ist_date_str(unix_ts):
 
 
 def _empty_strategy_state():
-    return {"positions": {}, "closedTrades": [], "dailyStats": {}}
+    return {"positions": {}, "closedTrades": [], "dailyStats": {}, "cooldowns": {}}
 
 
 def read_state():
@@ -90,6 +110,7 @@ def read_state():
     strategies = state.get("strategies", {})
     for key in STRATEGIES:
         strategies.setdefault(key, _empty_strategy_state())
+        strategies[key].setdefault("cooldowns", {})  # backfill for state written before "quality" existed
     state["strategies"] = strategies
     return state
 
@@ -390,12 +411,74 @@ def _run_strict_strategy(strat_state, symbol, item, now):
     return _position_snapshot(positions.get(symbol), ltp)
 
 
+def _run_quality_strategy(strat_state, symbol, item, now):
+    """The most selective strategy: requires the base indicators, MTF
+    signal, and an SMC trade setup to ALL agree on direction before
+    entering. Stop-loss/target are sized off the symbol's own ATR(14) —
+    each asset gets a stop that fits its actual volatility, rather than an
+    arbitrary flat point value. After a loss, that symbol is skipped for
+    QUALITY_COOLDOWN_SECONDS so the bot can't immediately re-enter the same
+    failing setup."""
+    positions = strat_state["positions"]
+    cooldowns = strat_state.setdefault("cooldowns", {})
+    pos = positions.get(symbol)
+    ltp = item["ltp"]
+
+    if pos is None:
+        if now < cooldowns.get(symbol, 0):
+            return _position_snapshot(None, ltp)  # still cooling down after a recent loss
+
+        atr = item.get("atr14")
+        if not atr or atr <= 0:
+            return _position_snapshot(None, ltp)  # ATR not warmed up yet
+
+        setup = ((item.get("smc") or {}).get("5m") or {}).get("tradeSetup")
+        mtf_signal = item.get("mtfSignal", "NEUTRAL")
+
+        bullish = _all_green(item) and mtf_signal == "BUY" and setup and setup["type"] == "bullish"
+        bearish = ALLOW_SHORTS and _all_red(item) and mtf_signal == "SELL" and setup and setup["type"] == "bearish"
+
+        if bullish:
+            positions[symbol] = {
+                "side": "LONG", "entryPrice": ltp, "entryTime": now,
+                "stopLoss": round(ltp - QUALITY_ATR_SL_MULT * atr, 2),
+                "target": round(ltp + QUALITY_ATR_TARGET_MULT * atr, 2),
+            }
+        elif bearish:
+            positions[symbol] = {
+                "side": "SHORT", "entryPrice": ltp, "entryTime": now,
+                "stopLoss": round(ltp + QUALITY_ATR_SL_MULT * atr, 2),
+                "target": round(ltp - QUALITY_ATR_TARGET_MULT * atr, 2),
+            }
+    else:
+        exit_reason = None
+        if pos["side"] == "LONG":
+            if ltp <= pos["stopLoss"]:
+                exit_reason = "hit stop loss"
+            elif ltp >= pos["target"]:
+                exit_reason = "hit target"
+        else:
+            if ltp >= pos["stopLoss"]:
+                exit_reason = "hit stop loss"
+            elif ltp <= pos["target"]:
+                exit_reason = "hit target"
+
+        if exit_reason:
+            trade = _close_trade("quality", strat_state, symbol, pos, ltp, exit_reason, now)
+            del positions[symbol]
+            if trade["pnlPct"] <= 0:
+                cooldowns[symbol] = now + QUALITY_COOLDOWN_SECONDS
+
+    return _position_snapshot(positions.get(symbol), ltp)
+
+
 STRATEGY_RUNNERS = {
     "base": _run_base_strategy,
     "smc": _run_smc_strategy,
     "mtf": _run_mtf_strategy,
     "confluence": _run_confluence_strategy,
     "strict": _run_strict_strategy,
+    "quality": _run_quality_strategy,
 }
 
 
