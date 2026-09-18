@@ -145,6 +145,7 @@
         <button class="filter-btn bot-btn" onclick="setBotStrategy('mtf', this)">MTF (5M+15M+1H)</button>
         <button class="filter-btn bot-btn" onclick="setBotStrategy('confluence', this)">Confluence (Green+OB+FVG)</button>
         <button class="filter-btn bot-btn" onclick="setBotStrategy('strict', this)">Strict (All 7 + hold-through-2)</button>
+        <button class="filter-btn bot-btn" onclick="setBotStrategy('quality', this)">Quality (Base+MTF+SMC, ATR, cooldown)</button>
     </div>
 
     <table>
@@ -235,6 +236,7 @@
             mtf: "MTF (5M+15M+1H)",
             confluence: "Confluence (Green+OB+FVG)",
             strict: "Strict (All 7 + hold-through-2)",
+            quality: "Quality (Base+MTF+SMC, ATR, cooldown)",
         };
 
         function setFilter(category, button) {
