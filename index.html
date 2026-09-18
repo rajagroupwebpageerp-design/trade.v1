@@ -143,6 +143,7 @@
         <button class="filter-btn bot-btn active" onclick="setBotStrategy('base', this)">Base (EMA/RSI/MACD/VWAP)</button>
         <button class="filter-btn bot-btn" onclick="setBotStrategy('smc', this)">SMC (OB/FVG/QML)</button>
         <button class="filter-btn bot-btn" onclick="setBotStrategy('mtf', this)">MTF (5M+15M+1H)</button>
+        <button class="filter-btn bot-btn" onclick="setBotStrategy('confluence', this)">Confluence (Green+OB+FVG)</button>
     </div>
 
     <table>
@@ -231,6 +232,7 @@
             base: "Base (EMA/RSI/MACD/VWAP)",
             smc: "SMC (OB/FVG/QML)",
             mtf: "MTF (5M+15M+1H)",
+            confluence: "Confluence (Green+OB+FVG)",
         };
 
         function setFilter(category, button) {
