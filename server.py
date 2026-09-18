@@ -7,6 +7,7 @@ import threading
 import time
 
 import numpy as np
+import pandas as pd
 import yfinance as yf
 from curl_cffi import requests as curl_requests
 from flask import Flask, jsonify
@@ -169,6 +170,18 @@ def calculate_indicators(df):
     df["MACD"] = ema12 - ema26
     df["MACD_Signal"] = df["MACD"].ewm(span=9, adjust=False).mean()
 
+    # ATR (14) — Average True Range: a volatility measure used by the
+    # "quality" paper trading strategy to size its stop-loss/target per
+    # symbol, instead of a flat point value that doesn't fit every asset's
+    # price scale/noise level equally.
+    prev_close = df["Close"].shift()
+    true_range = pd.concat([
+        df["High"] - df["Low"],
+        (df["High"] - prev_close).abs(),
+        (df["Low"] - prev_close).abs(),
+    ], axis=1).max(axis=1)
+    df["ATR14"] = true_range.rolling(window=14).mean()
+
     return df
 
 
@@ -260,6 +273,11 @@ def fetch_one(name, ticker, category, session):
         vwap = round(float(latest["VWAP"]), 2) if not np.isnan(latest["VWAP"]) else ema21
         macd = round(float(latest["MACD"]), 2)
         macd_signal = round(float(latest["MACD_Signal"]), 2)
+        # ATR needs its own 14-bar warm-up separate from the other
+        # indicators — allowed to be None early on rather than blocking the
+        # whole cycle; only the "quality" paper strategy depends on it, and
+        # it simply waits until ATR is available.
+        atr14 = round(float(latest["ATR14"]), 4) if not np.isnan(latest["ATR14"]) else None
 
         if any(np.isnan(x) for x in [ema21, ema9, rsi, macd, macd_signal]):
             log.warning("%s (%s): latest bar still has NaN indicator(s), skipping this cycle", name, ticker)
@@ -317,6 +335,7 @@ def fetch_one(name, ticker, category, session):
             "macdBullish": macd_bullish,
             "vwapAbove": vwap_above,
             "emaBullish": ema_bullish,
+            "atr14": atr14,
             "signal": signal,
             "entry": entry,
             "sl": sl,
