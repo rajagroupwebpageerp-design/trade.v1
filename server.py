@@ -185,15 +185,15 @@ def calculate_indicators(df):
     return df
 
 
-def get_timeframe_bias(tf_df):
-    """Run the exact same EMA(9/21)/RSI/MACD/VWAP confluence rule used for
-    the main 5M signal, but on a (possibly resampled) higher-timeframe
-    dataframe. Returns 'bullish', 'bearish', or 'neutral' — 'neutral' also
-    covers not-enough-data / still-warming-up cases, since a higher
-    timeframe simply not agreeing with 5M should never itself be treated
-    as an error."""
+def get_timeframe_indicator_flags(tf_df):
+    """Compute the 4 base indicators (EMA9>21, RSI, MACD, VWAP) on a
+    (possibly resampled) OHLCV dataframe, returning the same field shapes
+    used for the 5M item ('emaBullish', 'vwapAbove', 'rsi', 'macdBullish')
+    so downstream code can treat any timeframe uniformly. Returns None if
+    there isn't enough data yet — never raises, since a still-warming-up
+    higher timeframe should never break the whole cycle."""
     if len(tf_df) < 26:
-        return "neutral"
+        return None
 
     tf_df = calculate_indicators(tf_df.copy())
     latest = tf_df.iloc[-1]
@@ -207,13 +207,29 @@ def get_timeframe_bias(tf_df):
     vwap = latest["VWAP"]
 
     if any(np.isnan(x) for x in [ema9, ema21, rsi, macd, macd_signal]):
-        return "neutral"
+        return None
 
     vwap_val = vwap if not np.isnan(vwap) else ema21
 
-    if ema9 > ema21 and close > vwap_val and rsi > 52 and macd > macd_signal:
+    return {
+        "emaBullish": bool(ema9 > ema21),
+        "vwapAbove": bool(close > vwap_val),
+        "rsi": round(float(rsi), 2),
+        "macdBullish": bool(macd > macd_signal),
+    }
+
+
+def get_timeframe_bias(tf_df):
+    """'bullish'/'bearish'/'neutral' verdict (all 4 base indicators must
+    agree) on a (possibly resampled) timeframe — used by the existing MTF
+    signal feature. 'neutral' covers both genuine disagreement and
+    not-enough-data, since either case should never itself be an error."""
+    flags = get_timeframe_indicator_flags(tf_df)
+    if flags is None:
+        return "neutral"
+    if flags["emaBullish"] and flags["vwapAbove"] and flags["rsi"] > 52 and flags["macdBullish"]:
         return "bullish"
-    if ema9 < ema21 and close < vwap_val and rsi < 48 and macd < macd_signal:
+    if (not flags["emaBullish"]) and (not flags["vwapAbove"]) and flags["rsi"] < 48 and (not flags["macdBullish"]):
         return "bearish"
     return "neutral"
 
@@ -308,17 +324,31 @@ def fetch_one(name, ticker, category, session):
 
         # Multi-timeframe confirmation: check the SAME EMA/RSI/MACD/VWAP
         # confluence rule on 15M and 1H (resampled from these same 5M bars,
-        # so no extra Yahoo requests), and only call it a confirmed BUY/SELL
-        # when all three timeframes agree. This is separate from `signal`
-        # above (which stays 5M-only) so both can be shown side by side.
+        # so no extra Yahoo requests). Computed as individual flags (not
+        # just a collapsed bullish/bearish verdict) so the "precision"
+        # paper strategy can count how many of the 4 base indicators are
+        # green per timeframe, not just whether all 4 agree.
         bias_5m = "bullish" if signal == "BUY" else ("bearish" if signal == "SELL" else "neutral")
+        flags_5m = {"emaBullish": ema_bullish, "vwapAbove": vwap_above, "rsi": rsi, "macdBullish": macd_bullish}
         try:
             ohlcv = df[["Open", "High", "Low", "Close", "Volume"]]
-            bias_15m = get_timeframe_bias(resample_ohlc(ohlcv, "15min"))
-            bias_1h = get_timeframe_bias(resample_ohlc(ohlcv, "60min"))
+            flags_15m = get_timeframe_indicator_flags(resample_ohlc(ohlcv, "15min"))
+            flags_1h = get_timeframe_indicator_flags(resample_ohlc(ohlcv, "60min"))
         except Exception as e:
-            log.warning("%s (%s): MTF bias computation failed: %s", name, ticker, e)
-            bias_15m, bias_1h = "neutral", "neutral"
+            log.warning("%s (%s): MTF indicator computation failed: %s", name, ticker, e)
+            flags_15m, flags_1h = None, None
+
+        def _bias_from_flags(flags):
+            if flags is None:
+                return "neutral"
+            if flags["emaBullish"] and flags["vwapAbove"] and flags["rsi"] > 52 and flags["macdBullish"]:
+                return "bullish"
+            if (not flags["emaBullish"]) and (not flags["vwapAbove"]) and flags["rsi"] < 48 and (not flags["macdBullish"]):
+                return "bearish"
+            return "neutral"
+
+        bias_15m = _bias_from_flags(flags_15m)
+        bias_1h = _bias_from_flags(flags_1h)
 
         if bias_5m == "bullish" and bias_15m == "bullish" and bias_1h == "bullish":
             mtf_signal = "BUY"
@@ -343,6 +373,7 @@ def fetch_one(name, ticker, category, session):
             "smc": smc_data,
             "mtfSignal": mtf_signal,
             "mtfBias": {"5m": bias_5m, "15m": bias_15m, "1h": bias_1h},
+            "indicatorFlags": {"5m": flags_5m, "15m": flags_15m, "1h": flags_1h},
         }, None
 
     except Exception as e:
