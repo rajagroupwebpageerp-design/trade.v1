@@ -114,7 +114,10 @@
             <h2>Intraday Trading Scanner</h2>
             <p style="color: #94a3b8; margin: 0;">5M Technical Strategy: EMA (9/21), RSI, VWAP & MACD Filters + SMC (Order Blocks, FVG, QML)</p>
         </div>
-        <span id="apiStatus" class="status-badge">Connecting...</span>
+        <div style="display:flex; gap:10px; align-items:center;">
+            <button id="notifyBtn" class="filter-btn" onclick="requestNotificationPermission()">🔔 Enable Alerts</button>
+            <span id="apiStatus" class="status-badge">Connecting...</span>
+        </div>
     </div>
 
     <div class="controls">
@@ -213,6 +216,66 @@
         let currentCategory = "ALL";
         let currentTF = "5m";
         let lastPaperReport = null;
+        let notificationsEnabled = false;
+        let previousOpenPositions = {};
+        let firstPaperFetch = true;  // suppress alerts for positions that were already open before this page loaded
+
+        function requestNotificationPermission() {
+            const btn = document.getElementById("notifyBtn");
+            if (!("Notification" in window)) {
+                alert("This browser doesn't support notifications. Sound alerts will still play.");
+                return;
+            }
+            Notification.requestPermission().then(permission => {
+                notificationsEnabled = permission === "granted";
+                btn.innerText = notificationsEnabled ? "🔔 Alerts ON" : "🔕 Notifications blocked";
+            });
+        }
+
+        // Two-tone beep via Web Audio API — no external audio file needed,
+        // so it works the same on GitHub Pages with no extra assets.
+        function playAlertSound() {
+            try {
+                const ctx = new (window.AudioContext || window.webkitAudioContext)();
+                const playTone = (freq, startOffset, duration) => {
+                    const osc = ctx.createOscillator();
+                    const gain = ctx.createGain();
+                    osc.connect(gain);
+                    gain.connect(ctx.destination);
+                    osc.frequency.value = freq;
+                    gain.gain.setValueAtTime(0.25, ctx.currentTime + startOffset);
+                    gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + startOffset + duration);
+                    osc.start(ctx.currentTime + startOffset);
+                    osc.stop(ctx.currentTime + startOffset + duration);
+                };
+                playTone(880, 0, 0.25);
+                playTone(1046, 0.3, 0.35);
+            } catch (e) {
+                // Audio not available in this browser/context — silently skip.
+            }
+        }
+
+        // Compares this fetch's open Precision positions against last
+        // fetch's, and fires a popup + sound for any symbol that's newly
+        // open. Positions already open on the very first page load are
+        // NOT alerted (nothing "new" happened, the page just started).
+        function checkForNewEntries(openPositions) {
+            openPositions = openPositions || {};
+            if (!firstPaperFetch) {
+                Object.keys(openPositions).forEach(symbol => {
+                    if (!previousOpenPositions[symbol]) {
+                        const pos = openPositions[symbol];
+                        const msg = `${pos.side} ${symbol} @ ₹${pos.entryPrice}`;
+                        if (notificationsEnabled && "Notification" in window) {
+                            new Notification("Precision Entry Alert", { body: msg });
+                        }
+                        playAlertSound();
+                    }
+                });
+            }
+            previousOpenPositions = openPositions;
+            firstPaperFetch = false;
+        }
 
         function setFilter(category, button) {
             currentCategory = category;
@@ -386,6 +449,7 @@ const response = await fetch("https://trade-v1-1.onrender.com/api/live-data");
             try {
                 const response = await fetch("https://trade-v1-1.onrender.com/api/paper-trades");
                 lastPaperReport = await response.json();
+                checkForNewEntries((lastPaperReport.precision || {}).openPositions);
                 renderPaperPanels();
             } catch (err) {
                 // Silent — the main status badge already reports connectivity issues.
