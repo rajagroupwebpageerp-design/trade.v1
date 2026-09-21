@@ -4,9 +4,17 @@ strategy: "precision" — weighted multi-timeframe scoring across 7
 conditions (EMA, RSI, MACD, VWAP, Order Block, FVG, QML), each counted
 independently per timeframe:
 
-  - 1H  (macro bias):           >= 5 of 7 conditions green
+  - 1H  (macro bias):            >= 5 of 7 conditions green
   - 15M (intermediate momentum): >= 6 of 7 conditions green
-  - 5M  (execution trigger):     exactly 7 of 7 conditions green
+  - 5M  (execution trigger):     >= 6 of 7 conditions green (loosened from
+                                  an exact 7/7 — that produced too few
+                                  trades in practice)
+
+QML counts as green if its status is "confirmed" OR "forming" (loosened
+from confirmed-only, which was the single rarest condition to satisfy —
+requiring the neckline break to have already happened was too strict for
+a real-time entry trigger; "forming" still means the underlying structure
+exists, just not yet confirmed).
 
 All three timeframe thresholds must be true AT THE SAME TIME to open a
 position (LONG if the bullish side qualifies, SHORT if the bearish side
@@ -54,7 +62,7 @@ FIXED_TARGET_POINTS = 10
 # Per-timeframe minimum green-condition counts (out of 7).
 PRECISION_MIN_1H = 5    # macro bias: at most 2 of 7 may fail
 PRECISION_MIN_15M = 6   # intermediate momentum: at most 1 of 7 may fail
-PRECISION_MIN_5M = 7    # execution trigger: exactly all 7 must be green
+PRECISION_MIN_5M = 6    # execution trigger: loosened from exact 7/7 — allow 1 miss (was too rarely hit)
 
 STRATEGIES = ["precision"]
 
@@ -186,7 +194,7 @@ def _seven_flags_for_tf(item, tf, side):
 
     ob_ok = _has_unmitigated(obs, zone_type)
     fvg_ok = _has_unmitigated(fvgs, zone_type)
-    qml_ok = bool(qml_b and qml_b.get("status") == "confirmed") if want_bullish else bool(qml_s and qml_s.get("status") == "confirmed")
+    qml_ok = bool(qml_b and qml_b.get("status") in ("confirmed", "forming")) if want_bullish else bool(qml_s and qml_s.get("status") in ("confirmed", "forming"))
 
     return [ema_ok, rsi_ok, macd_ok, vwap_ok, ob_ok, fvg_ok, qml_ok]
 
