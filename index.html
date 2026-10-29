@@ -54,11 +54,6 @@
             border-color: #3b82f6;
         }
 
-        .tf-btn.active {
-            background-color: #a855f7;
-            border-color: #a855f7;
-        }
-
         .status-badge {
             padding: 8px 14px;
             border-radius: 6px;
@@ -66,6 +61,82 @@
             font-weight: bold;
             background-color: #334155;
             color: #38bdf8;
+        }
+
+        .alarm-bar {
+            display: flex;
+            gap: 12px;
+            align-items: center;
+            flex-wrap: wrap;
+            background-color: var(--card-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            padding: 10px 14px;
+            margin-bottom: 15px;
+        }
+
+        .alarm-bar select {
+            background-color: #334155;
+            color: #f8fafc;
+            border: 1px solid var(--border-color);
+            border-radius: 6px;
+            padding: 7px 10px;
+            font-weight: 600;
+        }
+
+        .sound-btn {
+            background-color: #16a34a;
+            color: #fff;
+            border: none;
+            padding: 8px 16px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-weight: 700;
+        }
+
+        .sound-btn.on { background-color: #334155; color: #22c55e; border: 1px solid #22c55e; }
+
+        .test-btn {
+            background-color: #334155;
+            color: #f8fafc;
+            border: 1px solid var(--border-color);
+            padding: 8px 16px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-weight: 600;
+        }
+
+        #alarmBanner {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            z-index: 1000;
+            padding: 16px 20px;
+            background-color: #dc2626;
+            color: #fff;
+            font-size: 1.1rem;
+            font-weight: 700;
+            justify-content: space-between;
+            align-items: center;
+            animation: flash 0.6s infinite alternate;
+        }
+
+        @keyframes flash {
+            from { background-color: #dc2626; }
+            to { background-color: #7f1d1d; }
+        }
+
+        #alarmBanner button {
+            background-color: #fff;
+            color: #7f1d1d;
+            border: none;
+            padding: 10px 22px;
+            border-radius: 6px;
+            font-weight: 800;
+            font-size: 1rem;
+            cursor: pointer;
         }
 
         table {
@@ -95,13 +166,13 @@
             border-radius: 4px;
             font-size: 0.75rem;
             font-weight: 700;
-            cursor: default;
         }
 
         .bullish { background-color: rgba(34, 197, 94, 0.2); color: var(--accent-green); }
         .bearish { background-color: rgba(239, 68, 68, 0.2); color: var(--accent-red); }
         .neutral { background-color: rgba(148, 163, 184, 0.2); color: #94a3b8; }
 
+        .watch-cb { width: 18px; height: 18px; cursor: pointer; accent-color: #3b82f6; }
         .price-text { font-family: monospace; font-weight: 600; }
         .sl-text { color: #f87171; font-family: monospace; font-weight: 600; }
         .target-text { color: #4ade80; font-family: monospace; font-weight: 600; }
@@ -109,15 +180,54 @@
 </head>
 <body>
 
+    <div id="alarmBanner">
+        <span id="alarmMessage">New signal!</span>
+        <button onclick="stopAlarm()">STOP ALARM</button>
+    </div>
+
     <div class="header">
         <div>
             <h2>Intraday Trading Scanner</h2>
-            <p style="color: #94a3b8; margin: 0;">5M Technical Strategy: EMA (9/21), RSI, VWAP & MACD Filters + SMC (Order Blocks, FVG, QML)</p>
+            <p style="color: #94a3b8; margin: 0;">5M Technical Strategy: EMA (9/21), RSI, VWAP & MACD Filters</p>
         </div>
-        <div style="display:flex; gap:10px; align-items:center;">
-            <button id="notifyBtn" class="filter-btn" onclick="requestNotificationPermission()">🔔 Enable Alerts</button>
-            <span id="apiStatus" class="status-badge">Connecting...</span>
+        <span id="apiStatus" class="status-badge">Connecting...</span>
+    </div>
+
+    <div class="alarm-bar">
+        <button id="soundBtn" class="sound-btn" onclick="toggleSound()">🔔 Enable Alarm Sound</button>
+        <label for="alarmDuration"><strong>Alarm length:</strong></label>
+        <select id="alarmDuration" onchange="saveDuration()">
+            <option value="15">15 seconds</option>
+            <option value="30">30 seconds</option>
+            <option value="60">1 minute</option>
+            <option value="120">2 minutes</option>
+            <option value="300">5 minutes</option>
+        </select>
+        <label for="alarmScope"><strong>Alarm for:</strong></label>
+        <select id="alarmScope" onchange="saveAlarmSettings()">
+            <option value="selected">Selected stocks only</option>
+            <option value="all">All assets</option>
+        </select>
+        <label for="alarmSignal"><strong>When:</strong></label>
+        <select id="alarmSignal" onchange="saveAlarmSettings()">
+            <option value="BUY">BUY signal</option>
+            <option value="SELL">SELL signal</option>
+            <option value="BOTH">BUY or SELL</option>
+        </select>
+        <button class="test-btn" onclick="testAlarm()">Test Alarm</button>
+        <span id="watchCount" style="color:#94a3b8; font-size:0.85rem;"></span>
+        <span style="color:#94a3b8; font-size:0.85rem; flex-basis:100%;">Tick the box in the first column of the table to choose which stocks should ring the alarm. Click "Enable Alarm Sound" once after opening the page.</span>
+    </div>
+
+    <div class="alarm-bar" id="stockPanel" style="flex-direction:column; align-items:flex-start;">
+        <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
+            <strong>Select stocks for alarm:</strong>
+            <input id="symbolInput" type="text" placeholder="Type stock name, e.g. RELIANCE" onkeydown="if(event.key==='Enter') addSymbol()"
+                   style="background:#334155; color:#f8fafc; border:1px solid #334155; border-radius:6px; padding:8px 10px; min-width:230px;">
+            <button class="sound-btn" style="background:#3b82f6;" onclick="addSymbol()">+ Add</button>
         </div>
+        <div id="selectedChips" style="display:flex; gap:8px; flex-wrap:wrap;"></div>
+        <div id="symbolChoices" style="display:flex; gap:14px; flex-wrap:wrap; color:#94a3b8; font-size:0.9rem;"></div>
     </div>
 
     <div class="controls">
@@ -127,18 +237,10 @@
         <button class="filter-btn" onclick="setFilter('Equities', this)">Stocks & Indices</button>
     </div>
 
-    <div class="controls">
-        <span><strong>SMC Timeframe:</strong></span>
-        <button class="filter-btn tf-btn active" onclick="setTF('5m', this)">5M</button>
-        <button class="filter-btn tf-btn" onclick="setTF('15m', this)">15M</button>
-        <button class="filter-btn tf-btn" onclick="setTF('1h', this)">1H</button>
-        <button class="filter-btn tf-btn" onclick="setTF('4h', this)">4H</button>
-        <button class="filter-btn tf-btn" onclick="setTF('1d', this)">1D</button>
-    </div>
-
     <table>
         <thead>
             <tr>
+                <th>Alarm</th>
                 <th>Asset</th>
                 <th>Category</th>
                 <th>Live Price</th>
@@ -146,147 +248,211 @@
                 <th>RSI (14)</th>
                 <th>MACD Filter</th>
                 <th>VWAP Pos.</th>
-                <th>Order Block</th>
-                <th>FVG</th>
-                <th>QML</th>
-                <th>SMC Setup</th>
-                <th>SMC Entry</th>
-                <th>SMC SL</th>
-                <th>SMC Target</th>
                 <th>Intraday Signal</th>
                 <th>Entry Level</th>
                 <th>Stop Loss</th>
                 <th>Target (1:2)</th>
-                <th>MTF Signal (5M+15M+1H)</th>
-                <th>Paper Bot (Precision)</th>
             </tr>
         </thead>
         <tbody id="marketDataTable">
-            <tr><td colspan="20" style="text-align:center;">Loading intraday scanner data...</td></tr>
+            <tr><td colspan="12" style="text-align:center;">Loading intraday scanner data...</td></tr>
         </tbody>
     </table>
-
-    <div style="margin-top: 30px;">
-        <h3 style="margin-bottom: 10px;">Paper Trading Bot Performance — Precision Strategy <span style="font-weight:400; font-size:0.8rem; color:#94a3b8;">(simulated only — no real orders placed)</span></h3>
-        <div class="controls" id="paperStats">
-            <span class="status-badge">Total Trades: —</span>
-            <span class="status-badge">Win Rate: —</span>
-            <span class="status-badge">Total PnL: —</span>
-            <span class="status-badge">Avg PnL/Trade: —</span>
-        </div>
-        <table>
-            <thead>
-                <tr>
-                    <th>Symbol</th>
-                    <th>Side</th>
-                    <th>Entry</th>
-                    <th>Exit</th>
-                    <th>PnL %</th>
-                    <th>Exit Reason</th>
-                </tr>
-            </thead>
-            <tbody id="paperTradesTable">
-                <tr><td colspan="6" style="text-align:center;">No closed trades yet.</td></tr>
-            </tbody>
-        </table>
-    </div>
-
-    <div style="margin-top: 30px;">
-        <h3 style="margin-bottom: 10px;">Daily P&amp;L Summary <span style="font-weight:400; font-size:0.8rem; color:#94a3b8;">(IST trading days, simulated)</span></h3>
-        <table>
-            <thead>
-                <tr>
-                    <th>Date</th>
-                    <th>Trades</th>
-                    <th>Wins</th>
-                    <th>Losses</th>
-                    <th>Win Rate</th>
-                    <th>Total PnL %</th>
-                    <th>Avg PnL/Trade</th>
-                </tr>
-            </thead>
-            <tbody id="dailySummaryTable">
-                <tr><td colspan="7" style="text-align:center;">No trading days recorded yet.</td></tr>
-            </tbody>
-        </table>
-    </div>
 
     <script>
         let rawData = {};
         let currentCategory = "ALL";
-        let currentTF = "5m";
-        let lastPaperReport = null;
-        let notificationsEnabled = false;
-        let previousOpenPositions = {};
-        let firstPaperFetch = true;  // suppress alerts for positions that were already open before this page loaded
 
-        function requestNotificationPermission() {
-            const btn = document.getElementById("notifyBtn");
-            if (!("Notification" in window)) {
-                alert("This browser doesn't support notifications. Sound alerts will still play.");
-                return;
-            }
-            Notification.requestPermission().then(permission => {
-                notificationsEnabled = permission === "granted";
-                btn.innerText = notificationsEnabled ? "🔔 Alerts ON" : "🔕 Notifications blocked";
-            });
+        // ---------- Alarm ----------
+        let audioCtx = null;
+        let soundEnabled = false;
+        let osc = null;
+        let sirenInterval = null;
+        let alarmStopTimeout = null;
+        let prevSignals = null; // null until first successful load, so no alarm on page open
+
+        // Restore saved alarm length (default 30 seconds)
+        (function restoreDuration() {
+            let saved = "30";
+            try { saved = localStorage.getItem("alarmDuration") || "30"; } catch (e) {}
+            document.getElementById("alarmDuration").value = saved;
+        })();
+
+        function saveDuration() {
+            try { localStorage.setItem("alarmDuration", document.getElementById("alarmDuration").value); } catch (e) {}
         }
 
-        // Two-tone beep via Web Audio API — no external audio file needed,
-        // so it works the same on GitHub Pages with no extra assets.
-        function playAlertSound() {
+        function getDurationSeconds() {
+            return parseInt(document.getElementById("alarmDuration").value, 10) || 30;
+        }
+
+        function toggleSound() {
+            const btn = document.getElementById("soundBtn");
+            if (!soundEnabled) {
+                audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+                audioCtx.resume();
+                soundEnabled = true;
+                btn.textContent = "🔔 Alarm Sound ON";
+                btn.classList.add("on");
+            } else {
+                soundEnabled = false;
+                stopAlarm();
+                btn.textContent = "🔕 Alarm Sound OFF (click to enable)";
+                btn.classList.remove("on");
+            }
+        }
+
+        function startAlarm(message, seconds) {
+            document.getElementById("alarmMessage").textContent = "🚨 " + message;
+            document.getElementById("alarmBanner").style.display = "flex";
+
+            if (!soundEnabled || !audioCtx) return; // banner only if sound not enabled
+
+            clearTimers();
+            stopOscillator();
+
+            osc = audioCtx.createOscillator();
+            const gain = audioCtx.createGain();
+            osc.type = "square";
+            gain.gain.value = 0.25;
+            osc.connect(gain);
+            gain.connect(audioCtx.destination);
+            osc.frequency.value = 880;
+            osc.start();
+
+            // Siren: alternate between two tones every 0.4 seconds
+            let high = false;
+            sirenInterval = setInterval(() => {
+                if (osc) osc.frequency.setValueAtTime(high ? 880 : 660, audioCtx.currentTime);
+                high = !high;
+            }, 400);
+
+            alarmStopTimeout = setTimeout(stopAlarm, seconds * 1000);
+        }
+
+        function clearTimers() {
+            if (sirenInterval) { clearInterval(sirenInterval); sirenInterval = null; }
+            if (alarmStopTimeout) { clearTimeout(alarmStopTimeout); alarmStopTimeout = null; }
+        }
+
+        function stopOscillator() {
+            if (osc) {
+                try { osc.stop(); } catch (e) {}
+                osc = null;
+            }
+        }
+
+        function stopAlarm() {
+            clearTimers();
+            stopOscillator();
+            document.getElementById("alarmBanner").style.display = "none";
+        }
+
+        function testAlarm() {
+            if (!soundEnabled) toggleSound();
+            startAlarm("TEST ALARM - this is how a new signal will sound", getDurationSeconds());
+        }
+
+        // ---------- Watchlist (stocks selected for alarm) ----------
+        let watchlist = new Set();
+
+        (function restoreWatchSettings() {
             try {
-                const ctx = new (window.AudioContext || window.webkitAudioContext)();
-                const playTone = (freq, startOffset, duration) => {
-                    const osc = ctx.createOscillator();
-                    const gain = ctx.createGain();
-                    osc.connect(gain);
-                    gain.connect(ctx.destination);
-                    osc.frequency.value = freq;
-                    gain.gain.setValueAtTime(0.25, ctx.currentTime + startOffset);
-                    gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + startOffset + duration);
-                    osc.start(ctx.currentTime + startOffset);
-                    osc.stop(ctx.currentTime + startOffset + duration);
-                };
-                playTone(880, 0, 0.25);
-                playTone(1046, 0.3, 0.35);
-            } catch (e) {
-                // Audio not available in this browser/context — silently skip.
-            }
+                const saved = JSON.parse(localStorage.getItem("watchlist") || "[]");
+                if (Array.isArray(saved)) watchlist = new Set(saved.map(x => String(x).toUpperCase()));
+                document.getElementById("alarmScope").value = localStorage.getItem("alarmScope") || "selected";
+                document.getElementById("alarmSignal").value = localStorage.getItem("alarmSignal") || "BUY";
+            } catch (e) {}
+            updateWatchCount();
+        })();
+
+        function saveAlarmSettings() {
+            try {
+                localStorage.setItem("alarmScope", document.getElementById("alarmScope").value);
+                localStorage.setItem("alarmSignal", document.getElementById("alarmSignal").value);
+            } catch (e) {}
+            updateWatchCount();
         }
 
-        // Compares this fetch's open Precision positions against last
-        // fetch's, and fires a popup + sound for any symbol that's newly
-        // open. Positions already open on the very first page load are
-        // NOT alerted (nothing "new" happened, the page just started).
-        function checkForNewEntries(openPositions) {
-            openPositions = openPositions || {};
-            if (!firstPaperFetch) {
-                Object.keys(openPositions).forEach(symbol => {
-                    if (!previousOpenPositions[symbol]) {
-                        const pos = openPositions[symbol];
-                        const msg = `${pos.side} ${symbol} @ ₹${pos.entryPrice}`;
-                        if (notificationsEnabled && "Notification" in window) {
-                            new Notification("Precision Entry Alert", { body: msg });
-                        }
-                        playAlertSound();
-                    }
-                });
-            }
-            previousOpenPositions = openPositions;
-            firstPaperFetch = false;
-        }
-
-        function setFilter(category, button) {
-            currentCategory = category;
-            document.querySelectorAll('.filter-btn:not(.tf-btn)').forEach(btn => btn.classList.remove('active'));
-            button.classList.add('active');
+        function toggleWatch(symbol, checked) {
+            symbol = String(symbol).toUpperCase();
+            if (checked) watchlist.add(symbol); else watchlist.delete(symbol);
+            try { localStorage.setItem("watchlist", JSON.stringify([...watchlist])); } catch (e) {}
+            updateWatchCount();
             renderTable();
         }
 
-        function setTF(tf, button) {
-            currentTF = tf;
-            document.querySelectorAll('.tf-btn').forEach(btn => btn.classList.remove('active'));
+        function addSymbol() {
+            const input = document.getElementById("symbolInput");
+            const name = input.value.toUpperCase().replace(/[^A-Z0-9&._ -]/g, "").trim();
+            if (name) toggleWatch(name, true);
+            input.value = "";
+        }
+
+        function renderWatchPanel() {
+            const chips = document.getElementById("selectedChips");
+            chips.innerHTML = [...watchlist].map(sym =>
+                `<span class="badge bullish" style="font-size:0.85rem; padding:6px 10px;">${sym}
+                    <a href="#" style="color:#f8fafc; margin-left:8px; text-decoration:none;" onclick="toggleWatch('${sym}', false); return false;">✕</a></span>`
+            ).join("");
+
+            const choices = document.getElementById("symbolChoices");
+            const symbols = Object.keys(rawData);
+            choices.innerHTML = symbols.length === 0
+                ? "Stock list will appear here once the server is connected. You can also type a name above."
+                : symbols.map(sym =>
+                    `<label style="cursor:pointer;"><input type="checkbox" class="watch-cb" ${watchlist.has(sym.toUpperCase()) ? "checked" : ""}
+                        onchange="toggleWatch('${sym}', this.checked)"> ${sym}</label>`
+                  ).join("");
+        }
+
+        function updateWatchCount() {
+            renderWatchPanel();
+            const scope = document.getElementById("alarmScope").value;
+            const el = document.getElementById("watchCount");
+            if (scope === "all") {
+                el.textContent = "Watching: all assets";
+            } else {
+                el.textContent = watchlist.size === 0
+                    ? "No stocks selected yet"
+                    : "Watching " + watchlist.size + ": " + [...watchlist].join(", ");
+            }
+        }
+
+        function signalMatches(signal) {
+            const want = document.getElementById("alarmSignal").value;
+            if (want === "BOTH") return signal === "BUY" || signal === "SELL";
+            return signal === want;
+        }
+
+        function checkForNewSignals() {
+            const current = {};
+            const fresh = [];
+            const scope = document.getElementById("alarmScope").value;
+
+            Object.keys(rawData).forEach(symbol => {
+                const item = rawData[symbol];
+                current[symbol] = item.signal;
+                const watched = scope === "all" || watchlist.has(symbol.toUpperCase());
+                if (prevSignals !== null &&
+                    watched &&
+                    signalMatches(item.signal) &&
+                    prevSignals[symbol] !== item.signal) {
+                    fresh.push(item.signal + " " + symbol + (item.entry > 0 ? " @ ₹" + item.entry : ""));
+                }
+            });
+
+            prevSignals = current;
+
+            if (fresh.length > 0) {
+                startAlarm("NEW SIGNAL: " + fresh.join("  |  "), getDurationSeconds());
+            }
+        }
+
+        // ---------- Scanner ----------
+        function setFilter(category, button) {
+            currentCategory = category;
+            document.querySelectorAll('.filter-btn').forEach(btn => btn.classList.remove('active'));
             button.classList.add('active');
             renderTable();
         }
@@ -295,96 +461,19 @@
             const statusBadge = document.getElementById("apiStatus");
 
             try {
-
-const response = await fetch("https://trade-v1-1.onrender.com/api/live-data");
+                const response = await fetch("http://localhost:5000/api/live-data");
                 rawData = await response.json();
 
                 statusBadge.innerText = "● LIVE FEED ACTIVE";
                 statusBadge.style.color = "#22c55e";
+                checkForNewSignals();
+                renderWatchPanel();
                 renderTable();
             } catch (err) {
                 statusBadge.innerText = "● SERVER OFFLINE";
                 statusBadge.style.color = "#ef4444";
-                document.getElementById("marketDataTable").innerHTML = `<tr><td colspan="20" style="text-align:center; color:#ef4444;">Unable to connect. Ensure python server.py is running.</td></tr>`;
+                document.getElementById("marketDataTable").innerHTML = `<tr><td colspan="12" style="text-align:center; color:#ef4444;">Unable to connect. Ensure python server.py is running.</td></tr>`;
             }
-        }
-
-        // Picks the single most relevant zone (closest to the live price) out
-        // of a list of OB/FVG zones for the currently selected timeframe.
-        // Prefers zones that haven't been mitigated/filled yet.
-        function pickNearestZone(zones, ltp) {
-            if (!zones || !zones.length) return null;
-            const unmitigated = zones.filter(z => !z.mitigated);
-            const pool = unmitigated.length ? unmitigated : zones;
-            let best = null;
-            let bestDist = Infinity;
-            pool.forEach(z => {
-                const mid = (z.top + z.bottom) / 2;
-                const dist = Math.abs(ltp - mid);
-                if (dist < bestDist) {
-                    bestDist = dist;
-                    best = z;
-                }
-            });
-            return best;
-        }
-
-        // Prefers a confirmed QML setup over one still forming; otherwise
-        // just returns whichever (bullish/bearish) is present.
-        function pickQml(smcTf) {
-            const candidates = [smcTf.qmlBullish, smcTf.qmlBearish].filter(Boolean);
-            if (!candidates.length) return null;
-            candidates.sort((a, b) => (a.status === 'confirmed' ? 0 : 1) - (b.status === 'confirmed' ? 0 : 1));
-            return candidates[0];
-        }
-
-        function zoneBadge(zone, bullLabel, bearLabel, mitigatedWord) {
-            if (!zone) return `<span class="badge neutral">-</span>`;
-            const cls = zone.type === 'bullish' ? 'bullish' : 'bearish';
-            const label = zone.type === 'bullish' ? bullLabel : bearLabel;
-            const dot = zone.mitigated ? ' •' : '';
-            const title = `${zone.bottom} – ${zone.top}${zone.mitigated ? ' (' + mitigatedWord + ')' : ''}`;
-            return `<span class="badge ${cls}" title="${title}">${label}${dot}</span>`;
-        }
-
-        function qmlBadge(qml) {
-            if (!qml) return `<span class="badge neutral">-</span>`;
-            const cls = qml.type === 'bullish' ? 'bullish' : 'bearish';
-            const label = qml.type === 'bullish' ? 'Bull QML' : 'Bear QML';
-            const title = `Neckline ${qml.neckline}, sweep ${qml.sweepLevel}`;
-            return `<span class="badge ${cls}" title="${title}">${label} (${qml.status})</span>`;
-        }
-
-        // The SMC trade setup combines whichever OB/FVG/QML zone is closest
-        // to the live price into a single long or short idea, tagged with
-        // which pattern it came from (OB/FVG/QML).
-        function smcSetupBadge(setup) {
-            if (!setup) return `<span class="badge neutral">-</span>`;
-            const cls = setup.type === 'bullish' ? 'bullish' : 'bearish';
-            const label = setup.type === 'bullish' ? 'LONG' : 'SHORT';
-            return `<span class="badge ${cls}">${label} (${setup.source})</span>`;
-        }
-
-        // MTF signal only fires BUY/SELL when 5M, 15M and 1H all agree;
-        // the tooltip shows each timeframe's individual bias so you can see
-        // why it's neutral when they don't line up.
-        function mtfSignalBadge(mtfSignal, mtfBias) {
-            const bias = mtfBias || { "5m": "neutral", "15m": "neutral", "1h": "neutral" };
-            const title = `5M: ${bias["5m"]} | 15M: ${bias["15m"]} | 1H: ${bias["1h"]}`;
-            if (mtfSignal === "BUY") return `<span class="badge bullish" title="${title}">BUY (LONG)</span>`;
-            if (mtfSignal === "SELL") return `<span class="badge bearish" title="${title}">SELL (SHORT)</span>`;
-            return `<span class="badge neutral" title="${title}">NEUTRAL</span>`;
-        }
-
-        // Paper bot: simulated position only, never a real order. Shows the
-        // open side, entry price and live unrealized PnL%; '-' when flat.
-        // The SMC strategy's positions also carry a 'source' (OB/FVG/QML).
-        function paperPositionBadge(pos) {
-            if (!pos) return `<span class="badge neutral">-</span>`;
-            const cls = pos.side === 'LONG' ? 'bullish' : 'bearish';
-            const pnlSign = pos.unrealizedPnlPct >= 0 ? '+' : '';
-            const sourceTag = pos.source ? ` [${pos.source}]` : '';
-            return `<span class="badge ${cls}">${pos.side}${sourceTag} @₹${pos.entryPrice} (${pnlSign}${pos.unrealizedPnlPct}%)</span>`;
         }
 
         function renderTable() {
@@ -404,18 +493,9 @@ const response = await fetch("https://trade-v1-1.onrender.com/api/live-data");
                 if (item.signal === "BUY") signalBadge = `<span class="badge bullish">BUY (LONG)</span>`;
                 if (item.signal === "SELL") signalBadge = `<span class="badge bearish">SELL (SHORT)</span>`;
 
-                const smcTf = (item.smc && item.smc[currentTF]) || { orderBlocks: [], fvg: [], qmlBullish: null, qmlBearish: null, tradeSetup: null };
-                const obBadge = zoneBadge(pickNearestZone(smcTf.orderBlocks, item.ltp), 'Bull OB', 'Bear OB', 'mitigated');
-                const fvgBadge = zoneBadge(pickNearestZone(smcTf.fvg, item.ltp), 'Bull FVG', 'Bear FVG', 'filled');
-                const qmlBadgeHtml = qmlBadge(pickQml(smcTf));
-                const setup = smcTf.tradeSetup;
-                const smcSetupHtml = smcSetupBadge(setup);
-                const smcEntry = setup ? '₹' + setup.entry : '-';
-                const smcSL = setup ? '₹' + setup.stopLoss : '-';
-                const smcTarget = setup ? '₹' + setup.target : '-';
-
                 const row = `
                     <tr>
+                        <td><input type="checkbox" class="watch-cb" ${watchlist.has(symbol.toUpperCase()) ? 'checked' : ''} onchange="toggleWatch('${symbol}', this.checked)" title="Ring alarm for ${symbol}"></td>
                         <td><strong>${symbol}</strong></td>
                         <td><span class="badge neutral">${item.category}</span></td>
                         <td class="price-text">₹${item.ltp}</td>
@@ -423,19 +503,10 @@ const response = await fetch("https://trade-v1-1.onrender.com/api/live-data");
                         <td>${item.rsi}</td>
                         <td><span class="badge ${item.macdBullish ? 'bullish' : 'bearish'}">${item.macdBullish ? 'Bullish' : 'Bearish'}</span></td>
                         <td>${item.vwapAbove ? 'Above VWAP' : 'Below VWAP'}</td>
-                        <td>${obBadge}</td>
-                        <td>${fvgBadge}</td>
-                        <td>${qmlBadgeHtml}</td>
-                        <td>${smcSetupHtml}</td>
-                        <td class="price-text">${smcEntry}</td>
-                        <td class="sl-text">${smcSL}</td>
-                        <td class="target-text">${smcTarget}</td>
                         <td>${signalBadge}</td>
                         <td class="price-text">${item.entry > 0 ? '₹' + item.entry : '-'}</td>
                         <td class="sl-text">${item.sl > 0 ? '₹' + item.sl : '-'}</td>
                         <td class="target-text">${item.target > 0 ? '₹' + item.target : '-'}</td>
-                        <td>${mtfSignalBadge(item.mtfSignal, item.mtfBias)}</td>
-                        <td>${paperPositionBadge(item.paperPositions ? item.paperPositions.precision : null)}</td>
                     </tr>
                 `;
                 tableBody.innerHTML += row;
@@ -444,99 +515,6 @@ const response = await fetch("https://trade-v1-1.onrender.com/api/live-data");
 
         fetchLiveMarketData();
         setInterval(fetchLiveMarketData, 10000);
-
-        async function fetchPaperTrades() {
-            try {
-                const response = await fetch("https://trade-v1-1.onrender.com/api/paper-trades");
-                lastPaperReport = await response.json();
-                checkForNewEntries((lastPaperReport.precision || {}).openPositions);
-                renderPaperPanels();
-            } catch (err) {
-                // Silent — the main status badge already reports connectivity issues.
-            }
-        }
-
-        // Pulls the precision strategy's report and renders it into the panels.
-        function renderPaperPanels() {
-            if (!lastPaperReport) return;
-            const strat = lastPaperReport.precision;
-            if (!strat) return;
-            renderPaperStats(strat.stats);
-            renderPaperTrades(strat.closedTrades);
-            renderDailySummary(strat.dailySummaries);
-        }
-
-        function renderPaperStats(stats) {
-            const el = document.getElementById("paperStats");
-            if (!stats) return;
-            const pnlColor = stats.totalPnlPct >= 0 ? '#22c55e' : '#ef4444';
-            el.innerHTML = `
-                <span class="status-badge">Total Trades: ${stats.totalTrades}</span>
-                <span class="status-badge">Win Rate: ${stats.winRatePct}% (${stats.wins}W / ${stats.losses}L)</span>
-                <span class="status-badge" style="color:${pnlColor};">Total PnL: ${stats.totalPnlPct >= 0 ? '+' : ''}${stats.totalPnlPct}%</span>
-                <span class="status-badge">Avg PnL/Trade: ${stats.avgPnlPct >= 0 ? '+' : ''}${stats.avgPnlPct}%</span>
-            `;
-        }
-
-        function renderPaperTrades(trades) {
-            const tbody = document.getElementById("paperTradesTable");
-            if (!trades || !trades.length) {
-                tbody.innerHTML = `<tr><td colspan="6" style="text-align:center;">No closed trades yet.</td></tr>`;
-                return;
-            }
-            tbody.innerHTML = "";
-            // Most recent first.
-            [...trades].reverse().forEach(t => {
-                const pnlClass = t.pnlPct >= 0 ? 'target-text' : 'sl-text';
-                const sideClass = t.side === 'LONG' ? 'bullish' : 'bearish';
-                tbody.innerHTML += `
-                    <tr>
-                        <td><strong>${t.symbol}</strong></td>
-                        <td><span class="badge ${sideClass}">${t.side}</span></td>
-                        <td class="price-text">₹${t.entryPrice}</td>
-                        <td class="price-text">₹${t.exitPrice}</td>
-                        <td class="${pnlClass}">${t.pnlPct >= 0 ? '+' : ''}${t.pnlPct}%</td>
-                        <td>${t.reason}</td>
-                    </tr>
-                `;
-            });
-        }
-
-        // Today's date in IST (UTC+5:30), to mark today's row in the daily
-        // summary table — matches how the backend groups trades by day.
-        function todayIST() {
-            const nowUtcMs = Date.now() + (new Date().getTimezoneOffset() * 60000);
-            const ist = new Date(nowUtcMs + (5.5 * 3600000));
-            return ist.toISOString().slice(0, 10);
-        }
-
-        function renderDailySummary(days) {
-            const tbody = document.getElementById("dailySummaryTable");
-            if (!days || !days.length) {
-                tbody.innerHTML = `<tr><td colspan="7" style="text-align:center;">No trading days recorded yet.</td></tr>`;
-                return;
-            }
-            const today = todayIST();
-            tbody.innerHTML = "";
-            days.forEach(d => {
-                const pnlClass = d.totalPnlPct >= 0 ? 'target-text' : 'sl-text';
-                const isToday = d.date === today;
-                tbody.innerHTML += `
-                    <tr${isToday ? ' style="background-color: rgba(59,130,246,0.12);"' : ''}>
-                        <td><strong>${d.date}${isToday ? ' (Today)' : ''}</strong></td>
-                        <td>${d.totalTrades}</td>
-                        <td>${d.wins}</td>
-                        <td>${d.losses}</td>
-                        <td>${d.winRatePct}%</td>
-                        <td class="${pnlClass}">${d.totalPnlPct >= 0 ? '+' : ''}${d.totalPnlPct}%</td>
-                        <td>${d.avgPnlPct >= 0 ? '+' : ''}${d.avgPnlPct}%</td>
-                    </tr>
-                `;
-            });
-        }
-
-        fetchPaperTrades();
-        setInterval(fetchPaperTrades, 10000);
     </script>
 </body>
 </html>
