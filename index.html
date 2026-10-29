@@ -36,6 +36,7 @@
             gap: 15px;
             margin-bottom: 15px;
             align-items: center;
+            flex-wrap: wrap;
         }
 
         .filter-btn {
@@ -60,6 +61,82 @@
             font-weight: bold;
             background-color: #334155;
             color: #38bdf8;
+        }
+
+        .alarm-bar {
+            display: flex;
+            gap: 12px;
+            align-items: center;
+            flex-wrap: wrap;
+            background-color: var(--card-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            padding: 10px 14px;
+            margin-bottom: 15px;
+        }
+
+        .alarm-bar select {
+            background-color: #334155;
+            color: #f8fafc;
+            border: 1px solid var(--border-color);
+            border-radius: 6px;
+            padding: 7px 10px;
+            font-weight: 600;
+        }
+
+        .sound-btn {
+            background-color: #16a34a;
+            color: #fff;
+            border: none;
+            padding: 8px 16px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-weight: 700;
+        }
+
+        .sound-btn.on { background-color: #334155; color: #22c55e; border: 1px solid #22c55e; }
+
+        .test-btn {
+            background-color: #334155;
+            color: #f8fafc;
+            border: 1px solid var(--border-color);
+            padding: 8px 16px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-weight: 600;
+        }
+
+        #alarmBanner {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            z-index: 1000;
+            padding: 16px 20px;
+            background-color: #dc2626;
+            color: #fff;
+            font-size: 1.1rem;
+            font-weight: 700;
+            justify-content: space-between;
+            align-items: center;
+            animation: flash 0.6s infinite alternate;
+        }
+
+        @keyframes flash {
+            from { background-color: #dc2626; }
+            to { background-color: #7f1d1d; }
+        }
+
+        #alarmBanner button {
+            background-color: #fff;
+            color: #7f1d1d;
+            border: none;
+            padding: 10px 22px;
+            border-radius: 6px;
+            font-weight: 800;
+            font-size: 1rem;
+            cursor: pointer;
         }
 
         table {
@@ -95,6 +172,7 @@
         .bearish { background-color: rgba(239, 68, 68, 0.2); color: var(--accent-red); }
         .neutral { background-color: rgba(148, 163, 184, 0.2); color: #94a3b8; }
 
+        .watch-cb { width: 18px; height: 18px; cursor: pointer; accent-color: #3b82f6; }
         .price-text { font-family: monospace; font-weight: 600; }
         .sl-text { color: #f87171; font-family: monospace; font-weight: 600; }
         .target-text { color: #4ade80; font-family: monospace; font-weight: 600; }
@@ -102,12 +180,54 @@
 </head>
 <body>
 
+    <div id="alarmBanner">
+        <span id="alarmMessage">New signal!</span>
+        <button onclick="stopAlarm()">STOP ALARM</button>
+    </div>
+
     <div class="header">
         <div>
             <h2>Intraday Trading Scanner</h2>
             <p style="color: #94a3b8; margin: 0;">5M Technical Strategy: EMA (9/21), RSI, VWAP & MACD Filters</p>
         </div>
         <span id="apiStatus" class="status-badge">Connecting...</span>
+    </div>
+
+    <div class="alarm-bar">
+        <button id="soundBtn" class="sound-btn" onclick="toggleSound()">🔔 Enable Alarm Sound</button>
+        <label for="alarmDuration"><strong>Alarm length:</strong></label>
+        <select id="alarmDuration" onchange="saveDuration()">
+            <option value="15">15 seconds</option>
+            <option value="30">30 seconds</option>
+            <option value="60">1 minute</option>
+            <option value="120">2 minutes</option>
+            <option value="300">5 minutes</option>
+        </select>
+        <label for="alarmScope"><strong>Alarm for:</strong></label>
+        <select id="alarmScope" onchange="saveAlarmSettings()">
+            <option value="selected">Selected stocks only</option>
+            <option value="all">All assets</option>
+        </select>
+        <label for="alarmSignal"><strong>When:</strong></label>
+        <select id="alarmSignal" onchange="saveAlarmSettings()">
+            <option value="BUY">BUY signal</option>
+            <option value="SELL">SELL signal</option>
+            <option value="BOTH">BUY or SELL</option>
+        </select>
+        <button class="test-btn" onclick="testAlarm()">Test Alarm</button>
+        <span id="watchCount" style="color:#94a3b8; font-size:0.85rem;"></span>
+        <span style="color:#94a3b8; font-size:0.85rem; flex-basis:100%;">Tick the box in the first column of the table to choose which stocks should ring the alarm. Click "Enable Alarm Sound" once after opening the page.</span>
+    </div>
+
+    <div class="alarm-bar" id="stockPanel" style="flex-direction:column; align-items:flex-start;">
+        <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
+            <strong>Select stocks for alarm:</strong>
+            <input id="symbolInput" type="text" placeholder="Type stock name, e.g. RELIANCE" onkeydown="if(event.key==='Enter') addSymbol()"
+                   style="background:#334155; color:#f8fafc; border:1px solid #334155; border-radius:6px; padding:8px 10px; min-width:230px;">
+            <button class="sound-btn" style="background:#3b82f6;" onclick="addSymbol()">+ Add</button>
+        </div>
+        <div id="selectedChips" style="display:flex; gap:8px; flex-wrap:wrap;"></div>
+        <div id="symbolChoices" style="display:flex; gap:14px; flex-wrap:wrap; color:#94a3b8; font-size:0.9rem;"></div>
     </div>
 
     <div class="controls">
@@ -120,6 +240,7 @@
     <table>
         <thead>
             <tr>
+                <th>Alarm</th>
                 <th>Asset</th>
                 <th>Category</th>
                 <th>Live Price</th>
@@ -134,7 +255,7 @@
             </tr>
         </thead>
         <tbody id="marketDataTable">
-            <tr><td colspan="11" style="text-align:center;">Loading intraday scanner data...</td></tr>
+            <tr><td colspan="12" style="text-align:center;">Loading intraday scanner data...</td></tr>
         </tbody>
     </table>
 
@@ -142,6 +263,193 @@
         let rawData = {};
         let currentCategory = "ALL";
 
+        // ---------- Alarm ----------
+        let audioCtx = null;
+        let soundEnabled = false;
+        let osc = null;
+        let sirenInterval = null;
+        let alarmStopTimeout = null;
+        let prevSignals = null; // null until first successful load, so no alarm on page open
+
+        // Restore saved alarm length (default 30 seconds)
+        (function restoreDuration() {
+            let saved = "30";
+            try { saved = localStorage.getItem("alarmDuration") || "30"; } catch (e) {}
+            document.getElementById("alarmDuration").value = saved;
+        })();
+
+        function saveDuration() {
+            try { localStorage.setItem("alarmDuration", document.getElementById("alarmDuration").value); } catch (e) {}
+        }
+
+        function getDurationSeconds() {
+            return parseInt(document.getElementById("alarmDuration").value, 10) || 30;
+        }
+
+        function toggleSound() {
+            const btn = document.getElementById("soundBtn");
+            if (!soundEnabled) {
+                audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+                audioCtx.resume();
+                soundEnabled = true;
+                btn.textContent = "🔔 Alarm Sound ON";
+                btn.classList.add("on");
+            } else {
+                soundEnabled = false;
+                stopAlarm();
+                btn.textContent = "🔕 Alarm Sound OFF (click to enable)";
+                btn.classList.remove("on");
+            }
+        }
+
+        function startAlarm(message, seconds) {
+            document.getElementById("alarmMessage").textContent = "🚨 " + message;
+            document.getElementById("alarmBanner").style.display = "flex";
+
+            if (!soundEnabled || !audioCtx) return; // banner only if sound not enabled
+
+            clearTimers();
+            stopOscillator();
+
+            osc = audioCtx.createOscillator();
+            const gain = audioCtx.createGain();
+            osc.type = "square";
+            gain.gain.value = 0.25;
+            osc.connect(gain);
+            gain.connect(audioCtx.destination);
+            osc.frequency.value = 880;
+            osc.start();
+
+            // Siren: alternate between two tones every 0.4 seconds
+            let high = false;
+            sirenInterval = setInterval(() => {
+                if (osc) osc.frequency.setValueAtTime(high ? 880 : 660, audioCtx.currentTime);
+                high = !high;
+            }, 400);
+
+            alarmStopTimeout = setTimeout(stopAlarm, seconds * 1000);
+        }
+
+        function clearTimers() {
+            if (sirenInterval) { clearInterval(sirenInterval); sirenInterval = null; }
+            if (alarmStopTimeout) { clearTimeout(alarmStopTimeout); alarmStopTimeout = null; }
+        }
+
+        function stopOscillator() {
+            if (osc) {
+                try { osc.stop(); } catch (e) {}
+                osc = null;
+            }
+        }
+
+        function stopAlarm() {
+            clearTimers();
+            stopOscillator();
+            document.getElementById("alarmBanner").style.display = "none";
+        }
+
+        function testAlarm() {
+            if (!soundEnabled) toggleSound();
+            startAlarm("TEST ALARM - this is how a new signal will sound", getDurationSeconds());
+        }
+
+        // ---------- Watchlist (stocks selected for alarm) ----------
+        let watchlist = new Set();
+
+        (function restoreWatchSettings() {
+            try {
+                const saved = JSON.parse(localStorage.getItem("watchlist") || "[]");
+                if (Array.isArray(saved)) watchlist = new Set(saved.map(x => String(x).toUpperCase()));
+                document.getElementById("alarmScope").value = localStorage.getItem("alarmScope") || "selected";
+                document.getElementById("alarmSignal").value = localStorage.getItem("alarmSignal") || "BUY";
+            } catch (e) {}
+            updateWatchCount();
+        })();
+
+        function saveAlarmSettings() {
+            try {
+                localStorage.setItem("alarmScope", document.getElementById("alarmScope").value);
+                localStorage.setItem("alarmSignal", document.getElementById("alarmSignal").value);
+            } catch (e) {}
+            updateWatchCount();
+        }
+
+        function toggleWatch(symbol, checked) {
+            symbol = String(symbol).toUpperCase();
+            if (checked) watchlist.add(symbol); else watchlist.delete(symbol);
+            try { localStorage.setItem("watchlist", JSON.stringify([...watchlist])); } catch (e) {}
+            updateWatchCount();
+            renderTable();
+        }
+
+        function addSymbol() {
+            const input = document.getElementById("symbolInput");
+            const name = input.value.toUpperCase().replace(/[^A-Z0-9&._() -]/g, "").trim();
+            if (name) toggleWatch(name, true);
+            input.value = "";
+        }
+
+        function renderWatchPanel() {
+            const chips = document.getElementById("selectedChips");
+            chips.innerHTML = [...watchlist].map(sym =>
+                `<span class="badge bullish" style="font-size:0.85rem; padding:6px 10px;">${sym}
+                    <a href="#" style="color:#f8fafc; margin-left:8px; text-decoration:none;" onclick="toggleWatch('${sym}', false); return false;">✕</a></span>`
+            ).join("");
+
+            const choices = document.getElementById("symbolChoices");
+            const symbols = Object.keys(rawData);
+            choices.innerHTML = symbols.length === 0
+                ? "Stock list will appear here once the server is connected. You can also type a name above."
+                : symbols.map(sym =>
+                    `<label style="cursor:pointer;"><input type="checkbox" class="watch-cb" ${watchlist.has(sym.toUpperCase()) ? "checked" : ""}
+                        onchange="toggleWatch('${sym}', this.checked)"> ${sym}</label>`
+                  ).join("");
+        }
+
+        function updateWatchCount() {
+            renderWatchPanel();
+            const scope = document.getElementById("alarmScope").value;
+            const el = document.getElementById("watchCount");
+            if (scope === "all") {
+                el.textContent = "Watching: all assets";
+            } else {
+                el.textContent = watchlist.size === 0
+                    ? "No stocks selected yet"
+                    : "Watching " + watchlist.size + ": " + [...watchlist].join(", ");
+            }
+        }
+
+        function signalMatches(signal) {
+            const want = document.getElementById("alarmSignal").value;
+            if (want === "BOTH") return signal === "BUY" || signal === "SELL";
+            return signal === want;
+        }
+
+        function checkForNewSignals() {
+            const current = {};
+            const fresh = [];
+            const scope = document.getElementById("alarmScope").value;
+
+            Object.keys(rawData).forEach(symbol => {
+                const item = rawData[symbol];
+                current[symbol] = item.signal;
+                const watched = scope === "all" || watchlist.has(symbol.toUpperCase());
+                if (prevSignals !== null &&
+                    watched &&
+                    signalMatches(item.signal) &&
+                    prevSignals[symbol] !== item.signal) {
+                    fresh.push(item.signal + " " + symbol + (item.entry > 0 ? " @ ₹" + item.entry : ""));
+                }
+            });
+
+            prevSignals = current;
+
+            if (fresh.length > 0) {
+                startAlarm("NEW SIGNAL: " + fresh.join("  |  "), getDurationSeconds());
+            }
+        }
+
+        // ---------- Scanner ----------
         function setFilter(category, button) {
             currentCategory = category;
             document.querySelectorAll('.filter-btn').forEach(btn => btn.classList.remove('active'));
@@ -158,11 +466,13 @@
 
                 statusBadge.innerText = "● LIVE FEED ACTIVE";
                 statusBadge.style.color = "#22c55e";
+                checkForNewSignals();
+                renderWatchPanel();
                 renderTable();
             } catch (err) {
                 statusBadge.innerText = "● SERVER OFFLINE";
                 statusBadge.style.color = "#ef4444";
-                document.getElementById("marketDataTable").innerHTML = `<tr><td colspan="11" style="text-align:center; color:#ef4444;">Unable to connect. Ensure python server.py is running.</td></tr>`;
+                document.getElementById("marketDataTable").innerHTML = `<tr><td colspan="12" style="text-align:center; color:#ef4444;">Unable to connect. Ensure python server.py is running.</td></tr>`;
             }
         }
 
@@ -185,6 +495,7 @@
 
                 const row = `
                     <tr>
+                        <td><input type="checkbox" class="watch-cb" ${watchlist.has(symbol.toUpperCase()) ? 'checked' : ''} onchange="toggleWatch('${symbol}', this.checked)" title="Ring alarm for ${symbol}"></td>
                         <td><strong>${symbol}</strong></td>
                         <td><span class="badge neutral">${item.category}</span></td>
                         <td class="price-text">₹${item.ltp}</td>
