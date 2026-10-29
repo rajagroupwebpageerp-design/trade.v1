@@ -172,6 +172,10 @@
         .bearish { background-color: rgba(239, 68, 68, 0.2); color: var(--accent-red); }
         .neutral { background-color: rgba(148, 163, 184, 0.2); color: #94a3b8; }
 
+        .controls select {
+            background-color: #334155; color: #f8fafc; border: 1px solid var(--border-color);
+            border-radius: 6px; padding: 7px 10px; font-weight: 600;
+        }
         .watch-cb { width: 18px; height: 18px; cursor: pointer; accent-color: #3b82f6; }
         .price-text { font-family: monospace; font-weight: 600; }
         .sl-text { color: #f87171; font-family: monospace; font-weight: 600; }
@@ -195,7 +199,7 @@
 
     <div class="alarm-bar">
         <label for="serverUrl"><strong>Server URL:</strong></label>
-        <input id="serverUrl" type="text" placeholder="https://your-app.onrender.com  (leave empty for localhost:5000)" onkeydown="if(event.key==='Enter') saveServerUrl()"
+        <input id="serverUrl" type="text" placeholder="https://trade-v1-1.onrender.com" onkeydown="if(event.key==='Enter') saveServerUrl()"
                style="background:#334155; color:#f8fafc; border:1px solid #334155; border-radius:6px; padding:8px 10px; min-width:340px;">
         <button class="sound-btn" style="background:#3b82f6;" onclick="saveServerUrl()">Save &amp; Connect</button>
         <span style="color:#94a3b8; font-size:0.85rem;">A free Render server can take up to ~50 seconds to wake up.</span>
@@ -243,10 +247,19 @@
         <button class="filter-btn active" onclick="setFilter('ALL', this)">All Assets</button>
         <button class="filter-btn" onclick="setFilter('Commodities', this)">Commodities</button>
         <button class="filter-btn" onclick="setFilter('Equities', this)">Stocks & Indices</button>
+        <span style="margin-left:15px;"><strong>SMC timeframe:</strong></span>
+        <select id="smcTf" onchange="saveSmcTf()">
+            <option value="5m">5 min</option>
+            <option value="15m">15 min</option>
+            <option value="1h">1 hour</option>
+            <option value="4h">4 hour</option>
+            <option value="1d">1 day</option>
+        </select>
     </div>
 
+    <div style="overflow-x:auto;">
     <table>
-        <thead>
+        <thead id="tableHead">
             <tr>
                 <th>Alarm</th>
                 <th>Asset</th>
@@ -266,6 +279,7 @@
             <tr><td colspan="12" style="text-align:center;">Loading intraday scanner data...</td></tr>
         </tbody>
     </table>
+    </div>
 
     <script>
         let rawData = {};
@@ -465,12 +479,14 @@
             renderTable();
         }
 
+        // Default server: your Render app. Change here if the address ever changes.
+        const DEFAULT_API_URL = "https://trade-v1-1.onrender.com/api/live-data";
         let isFetching = false;
 
         function getApiUrl() {
             let u = "";
             try { u = localStorage.getItem("apiUrl") || ""; } catch (e) {}
-            return u || "http://localhost:5000/api/live-data";
+            return u || DEFAULT_API_URL;
         }
 
         function saveServerUrl() {
@@ -489,7 +505,8 @@
         }
 
         (function restoreServerUrl() {
-            try { document.getElementById("serverUrl").value = localStorage.getItem("apiUrl") || ""; } catch (e) {}
+            document.getElementById("serverUrl").value = DEFAULT_API_URL;
+            try { document.getElementById("serverUrl").value = localStorage.getItem("apiUrl") || DEFAULT_API_URL; } catch (e) {}
         })();
 
         async function fetchLiveMarketData() {
@@ -515,9 +532,117 @@
             }
         }
 
+        // ---------- Extra fields from the server (SMC, MTF, etc.) ----------
+        const KNOWN_KEYS = ["category","ltp","ema21","rsi","macdBullish","vwapAbove","emaBullish","signal","entry","sl","target","atr14","smc","mtfSignal","mtfBias","indicatorFlags","paperPosition"];
+        const SMC_HEADERS = ["MTF Signal","Order Block (OB)","FVG","QML","SMC Setup (Entry / SL / Target)"];
+        const FIXED_HEADERS = ["Alarm","Asset","Category","Live Price","EMA (9/21)","RSI (14)","MACD Filter","VWAP Pos.","Intraday Signal","Entry Level","Stop Loss","Target (1:2)"];
+
+        function esc(v) {
+            return String(v).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+        }
+
+        function prettyKey(k) {
+            return k.replace(/([a-z0-9])([A-Z])/g, "$1 $2").replace(/[_-]+/g, " ").toUpperCase();
+        }
+
+        function getExtraKeys() {
+            const keys = [];
+            Object.keys(rawData).forEach(sym => {
+                const item = rawData[sym];
+                if (item && typeof item === "object") {
+                    Object.keys(item).forEach(k => {
+                        if (!KNOWN_KEYS.includes(k) && !keys.includes(k)) keys.push(k);
+                    });
+                }
+            });
+            return keys;
+        }
+
+        function formatExtra(v) {
+            if (v === null || v === undefined || v === "") return "-";
+            if (typeof v === "boolean") return `<span class="badge ${v ? 'bullish' : 'bearish'}">${v ? 'Yes' : 'No'}</span>`;
+            if (typeof v === "object") return esc(JSON.stringify(v));
+            const t = String(v);
+            if (/bull|buy|long/i.test(t)) return `<span class="badge bullish">${esc(t)}</span>`;
+            if (/bear|sell|short/i.test(t)) return `<span class="badge bearish">${esc(t)}</span>`;
+            return esc(t);
+        }
+
+        // ---------- SMC columns (OB, FVG, QML, trade setup, MTF) ----------
+        (function restoreSmcTf() {
+            let tf = "15m";
+            try { tf = localStorage.getItem("smcTf") || "15m"; } catch (e) {}
+            document.getElementById("smcTf").value = tf;
+        })();
+
+        function saveSmcTf() {
+            try { localStorage.setItem("smcTf", document.getElementById("smcTf").value); } catch (e) {}
+            renderTable();
+        }
+
+        function fmt(v) {
+            const n = Number(v);
+            if (isNaN(n)) return "-";
+            return n >= 100 ? n.toFixed(2) : n.toFixed(3);
+        }
+
+        function nearestZone(zones, type, ltp) {
+            const c = (zones || []).filter(z => z.type === type && !z.mitigated);
+            if (!c.length) return null;
+            return c.reduce((a, b) =>
+                Math.abs(ltp - (a.top + a.bottom) / 2) <= Math.abs(ltp - (b.top + b.bottom) / 2) ? a : b);
+        }
+
+        function zoneHtml(z, label, cls) {
+            return z ? `<div><span class="badge ${cls}">${label}</span> ${fmt(z.bottom)} – ${fmt(z.top)}</div>` : "";
+        }
+
+        function zonesCell(zones, ltp) {
+            const html = zoneHtml(nearestZone(zones, "bullish", ltp), "▲ Bull", "bullish") +
+                         zoneHtml(nearestZone(zones, "bearish", ltp), "▼ Bear", "bearish");
+            return html || "-";
+        }
+
+        function qmlHtml(q, arrow, cls) {
+            if (!q) return "";
+            return `<div title="Neckline ${fmt(q.neckline)}, sweep ${fmt(q.sweepLevel)}"><span class="badge ${cls}">${arrow} ${esc(q.status)}</span> ${fmt(q.zone[0])} – ${fmt(q.zone[1])}</div>`;
+        }
+
+        function biasArrow(b) {
+            return b === "bullish" ? "▲" : (b === "bearish" ? "▼" : "–");
+        }
+
+        function smcCells(item) {
+            const tf = document.getElementById("smcTf").value;
+            const smc = item.smc && item.smc[tf] ? item.smc[tf] : null;
+
+            let mtf = "-";
+            if (item.mtfSignal) {
+                const cls = item.mtfSignal === "BUY" ? "bullish" : (item.mtfSignal === "SELL" ? "bearish" : "neutral");
+                const b = item.mtfBias || {};
+                mtf = `<span class="badge ${cls}">${esc(item.mtfSignal)}</span>` +
+                      `<div style="color:#94a3b8; font-size:0.75rem;">5m ${biasArrow(b["5m"])} 15m ${biasArrow(b["15m"])} 1h ${biasArrow(b["1h"])}</div>`;
+            }
+            if (!smc) return `<td>${mtf}</td><td>-</td><td>-</td><td>-</td><td>-</td>`;
+
+            const ltp = Number(item.ltp);
+            const qml = qmlHtml(smc.qmlBullish, "▲", "bullish") + qmlHtml(smc.qmlBearish, "▼", "bearish");
+            const t = smc.tradeSetup;
+            const setup = t
+                ? `<div><span class="badge ${t.type === "bullish" ? "bullish" : "bearish"}">${t.type === "bullish" ? "▲ LONG" : "▼ SHORT"} · ${esc(t.source)}</span></div>` +
+                  `<div class="price-text">E ${fmt(t.entry)} · SL ${fmt(t.stopLoss)} · T ${fmt(t.target)}</div>`
+                : "-";
+
+            return `<td>${mtf}</td><td>${zonesCell(smc.orderBlocks, ltp)}</td><td>${zonesCell(smc.fvg, ltp)}</td><td>${qml || "-"}</td><td>${setup}</td>`;
+        }
+
         function renderTable() {
             const tableBody = document.getElementById("marketDataTable");
             tableBody.innerHTML = "";
+
+            const extraKeys = getExtraKeys();
+            document.getElementById("tableHead").innerHTML =
+                "<tr>" + FIXED_HEADERS.concat(SMC_HEADERS, extraKeys.map(prettyKey)).map(h => `<th>${esc(h)}</th>`).join("") + "</tr>";
 
             Object.keys(rawData).forEach(symbol => {
                 const item = rawData[symbol];
@@ -546,6 +671,8 @@
                         <td class="price-text">${item.entry > 0 ? '₹' + item.entry : '-'}</td>
                         <td class="sl-text">${item.sl > 0 ? '₹' + item.sl : '-'}</td>
                         <td class="target-text">${item.target > 0 ? '₹' + item.target : '-'}</td>
+                        ${smcCells(item)}
+                        ${extraKeys.map(k => `<td>${formatExtra(item[k])}</td>`).join("")}
                     </tr>
                 `;
                 tableBody.innerHTML += row;
