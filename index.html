@@ -194,6 +194,14 @@
     </div>
 
     <div class="alarm-bar">
+        <label for="serverUrl"><strong>Server URL:</strong></label>
+        <input id="serverUrl" type="text" placeholder="https://your-app.onrender.com  (leave empty for localhost:5000)" onkeydown="if(event.key==='Enter') saveServerUrl()"
+               style="background:#334155; color:#f8fafc; border:1px solid #334155; border-radius:6px; padding:8px 10px; min-width:340px;">
+        <button class="sound-btn" style="background:#3b82f6;" onclick="saveServerUrl()">Save &amp; Connect</button>
+        <span style="color:#94a3b8; font-size:0.85rem;">A free Render server can take up to ~50 seconds to wake up.</span>
+    </div>
+
+    <div class="alarm-bar">
         <button id="soundBtn" class="sound-btn" onclick="toggleSound()">🔔 Enable Alarm Sound</button>
         <label for="alarmDuration"><strong>Alarm length:</strong></label>
         <select id="alarmDuration" onchange="saveDuration()">
@@ -457,11 +465,40 @@
             renderTable();
         }
 
+        let isFetching = false;
+
+        function getApiUrl() {
+            let u = "";
+            try { u = localStorage.getItem("apiUrl") || ""; } catch (e) {}
+            return u || "http://localhost:5000/api/live-data";
+        }
+
+        function saveServerUrl() {
+            let u = document.getElementById("serverUrl").value.trim();
+            if (u) {
+                if (!/^https?:\/\//i.test(u)) u = "https://" + u;
+                u = u.replace(/\/+$/, "");
+                if (!/\/api\//.test(u)) u += "/api/live-data";
+            }
+            try {
+                if (u) localStorage.setItem("apiUrl", u); else localStorage.removeItem("apiUrl");
+            } catch (e) {}
+            document.getElementById("serverUrl").value = u;
+            prevSignals = null;
+            fetchLiveMarketData();
+        }
+
+        (function restoreServerUrl() {
+            try { document.getElementById("serverUrl").value = localStorage.getItem("apiUrl") || ""; } catch (e) {}
+        })();
+
         async function fetchLiveMarketData() {
+            if (isFetching) return;
+            isFetching = true;
             const statusBadge = document.getElementById("apiStatus");
 
             try {
-                const response = await fetch("http://localhost:5000/api/live-data");
+                const response = await fetch(getApiUrl());
                 rawData = await response.json();
 
                 statusBadge.innerText = "● LIVE FEED ACTIVE";
@@ -472,7 +509,9 @@
             } catch (err) {
                 statusBadge.innerText = "● SERVER OFFLINE";
                 statusBadge.style.color = "#ef4444";
-                document.getElementById("marketDataTable").innerHTML = `<tr><td colspan="12" style="text-align:center; color:#ef4444;">Unable to connect. Ensure python server.py is running.</td></tr>`;
+                document.getElementById("marketDataTable").innerHTML = `<tr><td colspan="12" style="text-align:center; color:#ef4444;">Unable to connect to ${getApiUrl()}. Check the Server URL above, or make sure the server is running (a free Render server may take ~50 seconds to wake up).</td></tr>`;
+            } finally {
+                isFetching = false;
             }
         }
 
