@@ -148,6 +148,7 @@
         }
 
         th, td {
+            white-space: nowrap;
             padding: 12px 14px;
             text-align: left;
             border-bottom: 1px solid var(--border-color);
@@ -203,6 +204,7 @@
                style="background:#334155; color:#f8fafc; border:1px solid #334155; border-radius:6px; padding:8px 10px; min-width:340px;">
         <button class="sound-btn" style="background:#3b82f6;" onclick="saveServerUrl()">Save &amp; Connect</button>
         <span style="color:#94a3b8; font-size:0.85rem;">A free Render server can take up to ~50 seconds to wake up.</span>
+        <span id="dataAge" style="font-size:0.85rem; font-weight:700; color:#94a3b8;"></span>
     </div>
 
     <div class="alarm-bar">
@@ -225,6 +227,7 @@
             <option value="BUY">BUY signal</option>
             <option value="SELL">SELL signal</option>
             <option value="BOTH">BUY or SELL</option>
+            <option value="GRADE_A">Grade A best setup only</option>
         </select>
         <button class="test-btn" onclick="testAlarm()">Test Alarm</button>
         <span id="watchCount" style="color:#94a3b8; font-size:0.85rem;"></span>
@@ -240,6 +243,15 @@
         </div>
         <div id="selectedChips" style="display:flex; gap:8px; flex-wrap:wrap;"></div>
         <div id="symbolChoices" style="display:flex; gap:14px; flex-wrap:wrap; color:#94a3b8; font-size:0.9rem;"></div>
+    </div>
+
+    <div class="alarm-bar" style="flex-direction:column; align-items:flex-start;">
+        <strong>🎯 Best setups right now (all signals combined)</strong>
+        <div id="topSetupsBody" style="display:flex; gap:12px; flex-wrap:wrap; width:100%;">Waiting for data...</div>
+        <div style="color:#94a3b8; font-size:0.8rem;">
+            Score counts: 5m signal (1) + 5m/15m/1h aligned (2) + SMC setup (1) + confirmed QML (1) + price near an OB/FVG zone (1). Grade A = 5-6, Grade B = 3-4.<br>
+            <strong>Exit plan:</strong> take profit at Target. After price moves in your favour by the same distance as your risk, move the stop to your entry. Exit if price closes beyond the stop or the MTF signal flips against you. For intraday, close before 3:15 PM IST. Risk only a small part of your money on each trade. This is a rule-based guide, not a prediction.
+        </div>
     </div>
 
     <div class="controls">
@@ -393,6 +405,7 @@
                 localStorage.setItem("alarmScope", document.getElementById("alarmScope").value);
                 localStorage.setItem("alarmSignal", document.getElementById("alarmSignal").value);
             } catch (e) {}
+            prevSignals = null; // changing the rule should not ring the alarm by itself
             updateWatchCount();
         }
 
@@ -441,8 +454,17 @@
             }
         }
 
+        function alarmKey(item) {
+            if (document.getElementById("alarmSignal").value === "GRADE_A") {
+                const bt = bestTrade(item);
+                return bt.grade === "A" ? "A-" + bt.dir : "NONE";
+            }
+            return item.signal;
+        }
+
         function signalMatches(signal) {
             const want = document.getElementById("alarmSignal").value;
+            if (want === "GRADE_A") return signal === "A-LONG" || signal === "A-SHORT";
             if (want === "BOTH") return signal === "BUY" || signal === "SELL";
             return signal === want;
         }
@@ -454,13 +476,19 @@
 
             Object.keys(rawData).forEach(symbol => {
                 const item = rawData[symbol];
-                current[symbol] = item.signal;
+                const key = alarmKey(item);
+                current[symbol] = key;
                 const watched = scope === "all" || watchlist.has(symbol.toUpperCase());
                 if (prevSignals !== null &&
                     watched &&
-                    signalMatches(item.signal) &&
-                    prevSignals[symbol] !== item.signal) {
-                    fresh.push(item.signal + " " + symbol + (item.entry > 0 ? " @ ₹" + item.entry : ""));
+                    signalMatches(key) &&
+                    prevSignals[symbol] !== key) {
+                    if (key.startsWith("A-")) {
+                        const bt = bestTrade(item);
+                        fresh.push("GRADE A " + bt.dir + " " + symbol + " | Entry " + fmt(bt.entry) + " SL " + fmt(bt.sl) + " T " + fmt(bt.target));
+                    } else {
+                        fresh.push(item.signal + " " + symbol + (item.entry > 0 ? " @ ₹" + item.entry : ""));
+                    }
                 }
             });
 
@@ -509,13 +537,36 @@
             try { document.getElementById("serverUrl").value = localStorage.getItem("apiUrl") || DEFAULT_API_URL; } catch (e) {}
         })();
 
+        async function updateDataAge() {
+            const el = document.getElementById("dataAge");
+            try {
+                const res = await fetch(getApiUrl().replace("/api/live-data", "/api/status"), { cache: "no-store" });
+                const st = await res.json();
+                if (!st.last_updated) { el.textContent = ""; return; }
+                const age = Math.max(0, Math.round(Date.now() / 1000 - st.last_updated));
+                const txt = age < 90 ? age + " sec" : Math.round(age / 60) + " min";
+                if (st.last_error) {
+                    el.style.color = "#ef4444";
+                    el.textContent = "⚠ Server problem: " + st.last_error;
+                } else if (age > 180) {
+                    el.style.color = "#f59e0b";
+                    el.textContent = "⚠ Server data is " + txt + " old (may be stale)";
+                } else {
+                    el.style.color = "#22c55e";
+                    el.textContent = "Server data updated " + txt + " ago";
+                }
+            } catch (e) {
+                el.textContent = "";
+            }
+        }
+
         async function fetchLiveMarketData() {
             if (isFetching) return;
             isFetching = true;
             const statusBadge = document.getElementById("apiStatus");
 
             try {
-                const response = await fetch(getApiUrl());
+                const response = await fetch(getApiUrl(), { cache: "no-store" });
                 rawData = await response.json();
 
                 statusBadge.innerText = "● LIVE FEED ACTIVE";
@@ -523,6 +574,7 @@
                 checkForNewSignals();
                 renderWatchPanel();
                 renderTable();
+                updateDataAge();
             } catch (err) {
                 statusBadge.innerText = "● SERVER OFFLINE";
                 statusBadge.style.color = "#ef4444";
@@ -577,6 +629,7 @@
 
         function saveSmcTf() {
             try { localStorage.setItem("smcTf", document.getElementById("smcTf").value); } catch (e) {}
+            prevSignals = null;
             renderTable();
         }
 
@@ -636,11 +689,95 @@
             return `<td>${mtf}</td><td>${zonesCell(smc.orderBlocks, ltp)}</td><td>${zonesCell(smc.fvg, ltp)}</td><td>${qml || "-"}</td><td>${setup}</td>`;
         }
 
+        // ---------- Best trade: combines every signal into one score ----------
+        function bestTrade(item) {
+            const tf = document.getElementById("smcTf").value;
+            const smc = item.smc && item.smc[tf] ? item.smc[tf] : null;
+            const ltp = Number(item.ltp);
+            const rsi = Number(item.rsi);
+
+            function evaluate(dir) {
+                const sig = dir === "bullish" ? "BUY" : "SELL";
+                let sc = 0;
+                const why = [];
+                if (item.signal === sig) { sc += 1; why.push("5m " + sig + " signal"); }
+                if (item.mtfSignal === sig) { sc += 2; why.push("5m/15m/1h aligned"); }
+                if (smc) {
+                    const t = smc.tradeSetup;
+                    if (t && t.type === dir) { sc += 1; why.push("SMC " + t.source + " setup"); }
+                    const q = dir === "bullish" ? smc.qmlBullish : smc.qmlBearish;
+                    if (q && q.status === "confirmed") { sc += 1; why.push("QML confirmed"); }
+                    const zones = [nearestZone(smc.orderBlocks, dir, ltp), nearestZone(smc.fvg, dir, ltp)].filter(Boolean);
+                    const near = zones.some(z => {
+                        const d = (ltp >= z.bottom && ltp <= z.top) ? 0 : Math.min(Math.abs(ltp - z.bottom), Math.abs(ltp - z.top));
+                        return d / ltp <= 0.005;
+                    });
+                    if (near) { sc += 1; why.push("price near OB/FVG"); }
+                }
+                if (dir === "bullish" && rsi > 75) { sc -= 1; why.push("RSI overbought"); }
+                if (dir === "bearish" && rsi < 25) { sc -= 1; why.push("RSI oversold"); }
+                return { sc, why };
+            }
+
+            const L = evaluate("bullish");
+            const S = evaluate("bearish");
+            const maxScore = Math.max(L.sc, S.sc);
+            const dir = L.sc > S.sc ? "bullish" : (S.sc > L.sc ? "bearish" : null);
+            if (!dir || maxScore < 3) return { grade: "WAIT", score: maxScore, why: [] };
+
+            const best = dir === "bullish" ? L : S;
+            const t = smc && smc.tradeSetup && smc.tradeSetup.type === dir ? smc.tradeSetup : null;
+            let entry = null, sl = null, target = null, mode = "";
+            if (t) {
+                entry = t.entry; sl = t.stopLoss; target = t.target; mode = "limit order at the zone";
+            } else if (item.signal === (dir === "bullish" ? "BUY" : "SELL") && item.entry > 0) {
+                entry = item.entry; sl = item.sl; target = item.target; mode = "market (current price)";
+            }
+            if (entry === null) return { grade: "WAIT", score: maxScore, why: best.why };
+
+            const risk = Math.abs(entry - sl);
+            if (!(risk > 0)) return { grade: "WAIT", score: maxScore, why: best.why };
+
+            return {
+                dir: dir === "bullish" ? "LONG" : "SHORT",
+                grade: best.sc >= 5 ? "A" : "B",
+                score: best.sc, why: best.why,
+                entry, sl, target, mode,
+                riskPct: risk / entry * 100,
+                dist: Math.abs(entry - ltp) / ltp * 100
+            };
+        }
+
+        function renderTopSetups() {
+            const rows = [];
+            Object.keys(rawData).forEach(sym => {
+                const bt = bestTrade(rawData[sym]);
+                if (bt.grade === "A" || bt.grade === "B") rows.push({ sym, bt, ltp: rawData[sym].ltp });
+            });
+            rows.sort((a, b) => b.bt.score - a.bt.score);
+            const el = document.getElementById("topSetupsBody");
+            if (!rows.length) {
+                el.innerHTML = "No strong setup right now. Waiting is also a decision.";
+                return;
+            }
+            el.innerHTML = rows.map(({ sym, bt, ltp }) => `
+                <div style="background:#0f172a; border:1px solid #334155; border-radius:8px; padding:10px 14px; min-width:260px;">
+                    <div><strong>${esc(sym)}</strong>
+                        <span class="badge ${bt.dir === "LONG" ? "bullish" : "bearish"}">${bt.dir === "LONG" ? "▲ LONG" : "▼ SHORT"}</span>
+                        <span class="badge ${bt.grade === "A" ? "bullish" : "neutral"}">Grade ${bt.grade} · ${bt.score}/6</span></div>
+                    <div style="color:#94a3b8; font-size:0.8rem; margin-top:4px;">Live price now: <strong style="color:#f8fafc;">${fmt(ltp)}</strong></div>
+                    <div class="price-text" style="margin-top:4px;">Entry ${fmt(bt.entry)} · SL ${fmt(bt.sl)} · Target ${fmt(bt.target)}</div>
+                    <div style="color:#94a3b8; font-size:0.8rem;">${bt.mode} · risk ${bt.riskPct.toFixed(2)}%${bt.dist > 0.3 ? " · price is " + bt.dist.toFixed(2) + "% away, wait for it" : ""}</div>
+                    <div style="color:#94a3b8; font-size:0.75rem;">${esc(bt.why.join(" · "))}</div>
+                </div>`).join("");
+        }
+
         function renderTable() {
             const tableBody = document.getElementById("marketDataTable");
             tableBody.innerHTML = "";
 
             const extraKeys = getExtraKeys();
+            renderTopSetups();
             document.getElementById("tableHead").innerHTML =
                 "<tr>" + FIXED_HEADERS.concat(SMC_HEADERS, extraKeys.map(prettyKey)).map(h => `<th>${esc(h)}</th>`).join("") + "</tr>";
 
